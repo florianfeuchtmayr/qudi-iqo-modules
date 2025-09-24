@@ -154,12 +154,8 @@ class AMC300_stepper(ScanningProbeInterface):
     def on_activate(self):
         # Initialize target positions with default safe values
         self._target_m = {}
-        for ax in self._axis_map:
-            pos_range = self._position_ranges.get(ax, [0.0, 0.001])  # fallback range
-            # Use middle of range as safe default, or current position if available
-            self._target_m[ax] = float(pos_range[0] + pos_range[1]) / 2.0
-
-        # Validate configuration
+        
+        # Validate configuration first
         if not self._axis_map:
             raise ValueError("axis_map cannot be empty")
         if not self._step_size_m:
@@ -173,6 +169,12 @@ class AMC300_stepper(ScanningProbeInterface):
                 raise ValueError(f"step_size_m missing for axis '{ax}'")
             if ax not in self._position_ranges:
                 raise ValueError(f"position_ranges missing for axis '{ax}'")
+        
+        # Initialize target positions after validation
+        for ax in self._axis_map:
+            pos_range = self._position_ranges.get(ax, [0.0, 0.001])  # fallback range
+            # Use middle of range as safe default, or current position if available
+            self._target_m[ax] = float(pos_range[0] + pos_range[1]) / 2.0
 
         # Build constraints
         axes = list()

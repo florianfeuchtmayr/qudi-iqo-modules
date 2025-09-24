@@ -289,28 +289,32 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         try:
             # 1) Get axes constraints from motion module 
             if self._sim_mode:
-                # In simulation, create basic axis constraints
+                # In simulation, create basic axis constraints matching the motion module's expected axes
                 from qudi.util.constraints import ScalarConstraint
-                axes = [
-                    ScannerAxis(name="x", unit="m", 
-                               position=ScalarConstraint(default=0.003, bounds=(0.0015, 0.0045)),
-                               step=ScalarConstraint(default=0, bounds=(0, 0.003)),
-                               resolution=ScalarConstraint(default=50, bounds=(1, 1000), enforce_int=True),
-                               frequency=ScalarConstraint(default=100, bounds=(1, 1000))),
-                    ScannerAxis(name="y", unit="m",
-                               position=ScalarConstraint(default=0.003, bounds=(0.0015, 0.0045)),
-                               step=ScalarConstraint(default=0, bounds=(0, 0.003)),
-                               resolution=ScalarConstraint(default=50, bounds=(1, 1000), enforce_int=True),
-                               frequency=ScalarConstraint(default=100, bounds=(1, 1000)))
-                ]
+                # Try to get axis names from motion module config if available, otherwise use defaults
+                try:
+                    motion_module = self._motion()
+                    if hasattr(motion_module, '_axis_map') and motion_module._axis_map:
+                        axis_names = list(motion_module._axis_map.keys())
+                    else:
+                        axis_names = ['x', 'y', 'z']  # sensible default
+                except Exception:
+                    axis_names = ['x', 'y', 'z']  # fallback if motion module not available
+                
+                axes = []
+                for axis_name in axis_names:
+                    axes.append(ScannerAxis(
+                        name=axis_name, unit="m",
+                        position=ScalarConstraint(default=0.003, bounds=(0.0015, 0.0045)),
+                        step=ScalarConstraint(default=0, bounds=(0, 0.003)),
+                        resolution=ScalarConstraint(default=50, bounds=(1, 1000), enforce_int=True),
+                        frequency=ScalarConstraint(default=100, bounds=(1, 1000))
+                    ))
                 axis_objects = tuple(axes)
             else:
                 motion_constraints = self._motion().constraints
-                # Handle both dict and tuple formats
-                if hasattr(motion_constraints.axis_objects, "values"):
-                    axis_objects = tuple(motion_constraints.axis_objects.values())
-                else:
-                    axis_objects = tuple(motion_constraints.axis_objects)
+                # motion_constraints.axis_objects is a tuple of ScannerAxis objects
+                axis_objects = motion_constraints.axis_objects
 
             # 2) Build channel constraints from our configured channels
             channel_objects: List[ScannerChannel] = []

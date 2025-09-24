@@ -438,25 +438,61 @@ class ScanningOptimizeLogic(LogicBase):
     def _check_scan_settings(self):
         """Basic check of scan settings for all axes."""
         scan_logic: ScanningProbeLogic = self._scan_logic()
+        available_axes = set(scan_logic.scanner_axes.keys())
+        settings_modified = False
 
-        for stg in [self.scan_range, self.scan_resolution, self.scan_frequency]:
-            axs = stg.keys()
-            for ax in axs:
-                if ax not in scan_logic.scanner_axes.keys():
-                    self.log.debug(f"Axis {ax} from optimizer scan settings not available on scanner" )
-                    raise ValueError
+        # Check and clean scan settings that contain invalid axes
+        for stg, stg_name in [(self.scan_range, 'scan_range'), 
+                              (self.scan_resolution, 'scan_resolution'), 
+                              (self.scan_frequency, 'scan_frequency')]:
+            invalid_axes = set(stg.keys()) - available_axes
+            if invalid_axes:
+                self.log.warning(f"Removing invalid axes {invalid_axes} from optimizer {stg_name}. "
+                               f"Available axes: {available_axes}")
+                for ax in invalid_axes:
+                    stg.pop(ax, None)
+                settings_modified = True
+        
+        # Also clean back scan settings
+        for stg, stg_name in [(self._back_scan_resolution, '_back_scan_resolution'),
+                              (self._back_scan_frequency, '_back_scan_frequency')]:
+            invalid_axes = set(stg.keys()) - available_axes
+            if invalid_axes:
+                self.log.warning(f"Removing invalid axes {invalid_axes} from optimizer {stg_name}")
+                for ax in invalid_axes:
+                    stg.pop(ax, None)
+                settings_modified = True
+        
+        # If we cleaned up settings, set defaults for missing axes
+        if settings_modified:
+            self.log.info("Optimizer scan settings were cleaned up. Setting defaults for any missing axes.")
+            self._set_default_scan_settings()
 
+        # Validate capabilities and constraints
         capability = scan_logic.back_scan_capability
         if self._back_scan_resolution and (BackScanCapability.RESOLUTION_CONFIGURABLE not in capability):
-            raise AssertionError('Back scan resolution cannot be configured for this scanner hardware.')
+            self.log.warning('Back scan resolution cannot be configured for this scanner hardware. Clearing back scan resolution.')
+            self._back_scan_resolution = {}
         if self._back_scan_frequency and (BackScanCapability.FREQUENCY_CONFIGURABLE not in capability):
-            raise AssertionError('Back scan frequency cannot be configured for this scanner hardware.')
-        for name, ax in scan_logic.scanner_axes.items():
-            ax.position.check(self.scan_range[name])
-            ax.resolution.check(self.scan_resolution[name])
-            ax.resolution.check(self.back_scan_resolution[name])
-            ax.frequency.check(self.scan_frequency[name])
-            ax.frequency.check(self.back_scan_frequency[name])
+            self.log.warning('Back scan frequency cannot be configured for this scanner hardware. Clearing back scan frequency.')
+            self._back_scan_frequency = {}
+        
+        # Validate settings against axis constraints
+        try:
+            for name, ax in scan_logic.scanner_axes.items():
+                if name in self.scan_range:
+                    ax.position.check(self.scan_range[name])
+                if name in self.scan_resolution:
+                    ax.resolution.check(self.scan_resolution[name])
+                if name in self.scan_frequency:
+                    ax.frequency.check(self.scan_frequency[name])
+                if name in self.back_scan_resolution:
+                    ax.resolution.check(self.back_scan_resolution[name])
+                if name in self.back_scan_frequency:
+                    ax.frequency.check(self.back_scan_frequency[name])
+        except Exception as e:
+            self.log.warning(f"Optimizer scan settings constraint validation failed: {e}. Using default settings.")
+            raise ValueError(f"Optimizer scan settings validation failed: {e}")
 
     def _set_default_scan_settings(self):
         """Set range, resolution and frequency to default values."""

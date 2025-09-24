@@ -287,19 +287,48 @@ class ScanningProbeLogic(LogicBase):
 
     def check_scan_settings(self):
         """Validate current scan settings for all possible 1D and 2D scans."""
-        for stg in [self.scan_ranges, self.scan_resolution, self.scan_frequency]:
-            axs = stg.keys()
-            for ax in axs:
-                if ax not in self.scanner_axes.keys():
-                    self.log.debug(f"Axis {ax} from scan settings not available on scanner" )
-                    raise ValueError
+        # Get current scanner axes
+        available_axes = set(self.scanner_axes.keys())
+        settings_modified = False
+        
+        # Check and clean scan settings that contain invalid axes
+        for stg, stg_name in [(self.scan_ranges, 'scan_ranges'), 
+                              (self.scan_resolution, 'scan_resolution'), 
+                              (self.scan_frequency, 'scan_frequency')]:
+            invalid_axes = set(stg.keys()) - available_axes
+            if invalid_axes:
+                self.log.warning(f"Removing invalid axes {invalid_axes} from {stg_name}. "
+                               f"Available axes: {available_axes}")
+                for ax in invalid_axes:
+                    stg.pop(ax, None)
+                settings_modified = True
+        
+        # Also clean back scan settings
+        for stg, stg_name in [(self._back_scan_resolution, '_back_scan_resolution'),
+                              (self._back_scan_frequency, '_back_scan_frequency')]:
+            invalid_axes = set(stg.keys()) - available_axes
+            if invalid_axes:
+                self.log.warning(f"Removing invalid axes {invalid_axes} from {stg_name}")
+                for ax in invalid_axes:
+                    stg.pop(ax, None)
+                settings_modified = True
+        
+        # If we had to clean up settings, use defaults for any missing axes
+        if settings_modified:
+            self.log.info("Scan settings were cleaned up. Setting defaults for any missing axes.")
+            self.set_default_scan_settings()
 
-        for dim in [1, 2]:
-            for axes in combinations(self.scanner_axes, dim):
-                settings = self.create_scan_settings(axes)
-                self.scanner_constraints.check_settings(settings)
-                back_settings = self.create_back_scan_settings(axes)
-                self.scanner_constraints.check_back_scan_settings(back_settings, settings)
+        # Validate that we can create valid scan settings for different dimensions
+        try:
+            for dim in [1, 2]:
+                for axes in combinations(self.scanner_axes, dim):
+                    settings = self.create_scan_settings(axes)
+                    self.scanner_constraints.check_settings(settings)
+                    back_settings = self.create_back_scan_settings(axes)
+                    self.scanner_constraints.check_back_scan_settings(back_settings, settings)
+        except Exception as e:
+            self.log.warning(f"Scan settings validation failed: {e}. Using default settings.")
+            raise ValueError(f"Scan settings validation failed: {e}")
 
     def set_scan_range(self, axis: str, rng: Tuple[float, float]) -> None:
         with self._thread_lock:
