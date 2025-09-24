@@ -210,7 +210,7 @@ class AMC300_stepper(ScanningProbeInterface):
                                            unit=unit,
                                            dtype='float64'))
 
-        back_scan_capability = BackScanCapability.AVAILABLE | BackScanCapability.RESOLUTION_CONFIGURABLE
+        back_scan_capability = BackScanCapability.NOT_AVAILABLE
         self._constraints = ScanConstraints(axis_objects=tuple(axes),
                                             channel_objects=tuple(channels),
                                             back_scan_capability=back_scan_capability,
@@ -321,7 +321,8 @@ class AMC300_stepper(ScanningProbeInterface):
         raise RuntimeError('AMC300_stepper is motion-only. Use AMC300NIScanningProbeInterfuse for scanning.')
 
     def configure_back_scan(self, settings: ScanSettings) -> None:
-        return
+        # Motion-only module does not perform scans by itself
+        raise RuntimeError('AMC300_stepper is motion-only. Use AMC300NIScanningProbeInterfuse for scanning.')
 
     # Movement
     def move_absolute(self, position: Dict[str, float], velocity: Optional[float] = None,
