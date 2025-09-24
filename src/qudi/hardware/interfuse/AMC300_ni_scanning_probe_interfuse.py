@@ -334,7 +334,7 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
             if self._back_scan_available:
                 back_scan_capability = BackScanCapability.AVAILABLE | BackScanCapability.RESOLUTION_CONFIGURABLE
             else:
-                back_scan_capability = BackScanCapability.RESOLUTION_CONFIGURABLE
+                back_scan_capability = BackScanCapability(0)  # No capabilities when back scan not available
 
             constraints = ScanConstraints(
                 axis_objects=axis_objects,
@@ -363,7 +363,7 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
             return ScanConstraints(
                 axis_objects=(fallback_axis,),
                 channel_objects=(fallback_channel,),
-                back_scan_capability=BackScanCapability.RESOLUTION_CONFIGURABLE,
+                back_scan_capability=BackScanCapability.AVAILABLE | BackScanCapability.RESOLUTION_CONFIGURABLE if self._back_scan_available else BackScanCapability(0),
                 has_position_feedback=False,
                 square_px_only=False,
             )
