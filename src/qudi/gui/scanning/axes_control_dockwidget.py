@@ -249,6 +249,9 @@ class AxesControlWidget(QtWidgets.QWidget):
     def set_resolution(self, resolution: Dict[str, int]) -> None:
         back_res = {}
         for ax, val in resolution.items():
+            # Skip axes that don't have corresponding GUI widgets
+            if ax not in self.axes_widgets:
+                continue
             spinbox = self.axes_widgets[ax]['forward_res_spinbox']
             spinbox.blockSignals(True)
             spinbox.setValue(val)
@@ -260,6 +263,9 @@ class AxesControlWidget(QtWidgets.QWidget):
     @QtCore.Slot(dict)
     def set_back_resolution(self, resolution: Dict[str, int]) -> None:
         for ax, val in resolution.items():
+            # Skip axes that don't have corresponding GUI widgets
+            if ax not in self.axes_widgets:
+                continue
             spinbox = self.axes_widgets[ax]['backward_res_spinbox']
             spinbox.blockSignals(True)
             spinbox.setValue(val)
@@ -272,6 +278,9 @@ class AxesControlWidget(QtWidgets.QWidget):
     @QtCore.Slot(dict)
     def set_range(self, rng: Dict[str, Tuple[float, float]]) -> None:
         for ax, val in rng.items():
+            # Skip axes that don't have corresponding GUI widgets
+            if ax not in self.axes_widgets:
+                continue
             min_spinbox = self.axes_widgets[ax]['min_spinbox']
             max_spinbox = self.axes_widgets[ax]['max_spinbox']
             min_val, max_val = val
@@ -288,6 +297,9 @@ class AxesControlWidget(QtWidgets.QWidget):
     @QtCore.Slot(dict)
     def set_target(self, target: Dict[str, float]):
         for ax, val in target.items():
+            # Skip axes that don't have corresponding GUI widgets
+            if ax not in self.axes_widgets:
+                continue
             spinbox = self.axes_widgets[ax]['pos_spinbox']
             slider = self.axes_widgets[ax]['slider']
             slider.blockSignals(True)
