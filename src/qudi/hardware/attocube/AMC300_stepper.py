@@ -1,57 +1,29 @@
 # -*- coding: utf-8 -*-
+
 """
 Attocube AMC300 stepper-based scanning probe hardware for Qudi.
 
-Implements ScanningProbeInterface for motion only (stepping; no analog fine output).
-Units:
-- Qudi external API uses meters.
-- AMC300 API uses nanometers for linear axes. We convert m <-> nm.
+Copyright (c) 2021, the qudi developers. See the AUTHORS.md file at the top-level directory of this
+distribution and on <https://github.com/Ulm-IQO/qudi-iqo-modules/>
 
-Key Python API calls (from AMC Interface Manual):
-    import AMC
-    dev = AMC.Device(ip)
-    dev.connect()
-    dev.close()
+This file is part of qudi.
 
-    # Motion
-    dev.move.setNSteps(axis, backward, step)
-    dev.move.setSingleStep(axis, backward)
-    dev.move.getPosition(axis) -> position_nm
-    dev.status.getStatusMoving(axis) -> 0 idle, 1 moving, 2 pending
-    dev.control.setControlOutput(axis, enable)
+Qudi is free software: you can redistribute it and/or modify it under the terms of
+the GNU Lesser General Public License as published by the Free Software Foundation,
+either version 3 of the License, or (at your option) any later version.
 
-Example config:
+Qudi is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU Lesser General Public License for more details.
 
-hardware:
-    amc300_stepper:
-        module.Class: 'attocube.AMC300_stepper.AMC300_stepper'
-        options:
-            ip_address: '192.168.1.1'
-            axis_map: { x: 0, y: 1, z: 2 }
-            step_size_m: { x: 2e-7, y: 2e-7, z: 2e-7 }   # meters per step
-            position_ranges:
-                x: [1.5e-3, 4.5e-3]
-                y: [1.5e-3, 4.5e-3]
-                z: [1.5e-3, 4.5e-3]
-            frequency_ranges:
-                x: [1, 500]
-                y: [1, 500]
-                z: [1, 100]
-            resolution_ranges:
-                x: [1, 100000]
-                y: [1, 100000]
-                z: [1, 100000]
-            input_channel_units:
-                APD2: 'c/s'
-            drive_enable_on_activate: false
-            settle_time_s: 0.001
-            max_move_timeout_s: 5.0
+You should have received a copy of the GNU Lesser General Public License along with qudi.
+If not, see <https://www.gnu.org/licenses/>.
+
 """
 
 from __future__ import annotations
 
 import time
-import math
 from typing import Dict, List, Optional
 
 from PySide2 import QtCore
@@ -72,6 +44,54 @@ from qudi.util.constraints import ScalarConstraint
 #from AMC_API import AMC
 
 class AMC300_stepper(ScanningProbeInterface):
+    """
+    Implements ScanningProbeInterface for motion only (stepping; no analog fine output).
+    Units:
+    - Qudi external API uses meters.
+    - AMC300 API uses nanometers for linear axes. We convert m <-> nm.
+
+    Key Python API calls (from AMC Interface Manual):
+        import AMC
+        dev = AMC.Device(ip)
+        dev.connect()
+        dev.close()
+
+        # Motion
+        dev.move.setNSteps(axis, backward, step)
+        dev.move.setSingleStep(axis, backward)
+        dev.move.getPosition(axis) -> position_nm
+        dev.status.getStatusMoving(axis) -> 0 idle, 1 moving, 2 pending
+        dev.control.setControlOutput(axis, enable)
+
+    Example Config:
+
+    amc300_stepper:
+        module.Class: 'attocube.AMC300_stepper.AMC300_stepper'
+        options:
+            ip_address: '192.168.1.1'
+            axis_map: { x: 0, y: 1, z: 2 }
+            step_size_m: { x: 2e-7, y: 2e-7, z: 2e-7 }   # meters per step
+            position_ranges:
+                x: [1.5e-3, 4.5e-3]
+                y: [1.5e-3, 4.5e-3]
+                z: [1.5e-3, 4.5e-3]
+            frequency_ranges:
+                x: [1, 500]
+                y: [1, 500]
+                z: [1, 100]
+            resolution_ranges:
+                x: [1, 100000]
+                y: [1, 100000]
+                z: [1, 100000]
+            input_channel_units:
+                APD: 'c/s'
+            drive_enable_on_activate: false
+            settle_time_s: 0.001
+            max_move_timeout_s: 5.0
+
+    """
+
+
     _threaded = True
 
     # Connection/config
@@ -103,12 +123,47 @@ class AMC300_stepper(ScanningProbeInterface):
     # Lifecycle
     def on_activate(self):
 
-        # Sanity check
-        # TODO check that config values within fsio range?
+        # Sanity check: require matching axes across ranges
         assert set(self._position_ranges) == set(self._frequency_ranges) == set(self._resolution_ranges), \
             f'Channels in position ranges, frequency ranges and resolution ranges do not coincide'
 
-        #contraints
+        # Connect to AMC before building constraints so we can seed defaults with actual position
+        try:
+            from qudi.hardware.attocube.AMC_API import AMC  # import AMC  # Provided by Attocube
+        except Exception as exc:
+            raise RuntimeError('AMC300_stepper: Could not import AMC Python package') from exc
+
+        with self._thread_lock:
+            self._dev = AMC.Device(self._ip_address)
+            self._dev.connect()
+
+            # Optionally enable drives
+            if self._drive_enable_on_activate:
+                for ax, ch in self._axis_map.items():
+                    try:
+                        self._dev.control.setControlOutput(ch, True)
+                    except Exception:
+                        # Some axes or configs may fail here; log but continue
+                        self.log.warning(f'AMC: setControlOutput failed for axis {ax}')
+
+            # Read current physical position for each axis (no movement)
+            current_pos: Dict[str, float] = {}
+            for ax, ch in self._axis_map.items():
+                try:
+                    pos_nm = float(self._dev.move.getPosition(ch))
+                    pos_m = pos_nm * 1e-9
+                except Exception:
+                    # Fallback to lower bound if reading fails
+                    pos_m = float(self._position_ranges[ax][0])
+                # Clip to configured bounds
+                rng = self._position_ranges[ax]
+                pos_m = min(max(pos_m, float(rng[0])), float(rng[1]))
+                current_pos[ax] = pos_m
+
+            # Set the internal target to the measured current position (no movement)
+            self._target_m = dict(current_pos)
+
+        # Build constraints AFTER we know the current position to use as default
         axes = list()
         for axis in self._position_ranges:
             position_range = tuple(self._position_ranges[axis])
@@ -122,7 +177,10 @@ class AMC300_stepper(ScanningProbeInterface):
                 freq_default = frequency_range[0]
             max_step = abs(position_range[1] - position_range[0])
 
-            position = ScalarConstraint(default=min(position_range), bounds=position_range)
+            # Use the measured current position as the default
+            pos_default = float(self._target_m.get(axis, position_range[0]))
+
+            position = ScalarConstraint(default=pos_default, bounds=position_range)
             resolution = ScalarConstraint(default=res_default, bounds=resolution_range, enforce_int=True)
             frequency = ScalarConstraint(default=freq_default, bounds=frequency_range)
             step = ScalarConstraint(default=0, bounds=(0, max_step))
@@ -132,8 +190,9 @@ class AMC300_stepper(ScanningProbeInterface):
                                     position=position,
                                     step=step,
                                     resolution=resolution,
-                                    frequency=frequency, )
+                                    frequency=frequency)
                         )
+
         channels = list()
         for channel, unit in self._input_channel_units.items():
             channels.append(ScannerChannel(name=channel,
@@ -141,38 +200,28 @@ class AMC300_stepper(ScanningProbeInterface):
                                            dtype='float64'))
 
         back_scan_capability = BackScanCapability.AVAILABLE | BackScanCapability.RESOLUTION_CONFIGURABLE
-        # cap = BackScanCapability.AVAILABLE if self._back_scan_available else BackScanCapability.NOT_AVAILABLE
         self._constraints = ScanConstraints(axis_objects=tuple(axes),
                                             channel_objects=tuple(channels),
                                             back_scan_capability=back_scan_capability,
                                             has_position_feedback=False,
                                             square_px_only=False)
 
+        # Notify listeners about the current position/target so GUIs can place the cursor immediately
         try:
-            from qudi.hardware.attocube.AMC_API import AMC  #import AMC  # Provided by Attocube
-        except Exception as exc:
-            raise RuntimeError('AMC300_stepper: Could not import AMC Python package') from exc
-
-        with self._thread_lock:
-            self._dev = AMC.Device(self._ip_address)
-            self._dev.connect()
-            # Optionally enable drives
-            if self._drive_enable_on_activate:
-                for ax, ch in self._axis_map.items():
-                    try:
-                        self._dev.control.setControlOutput(ch, True)
-                    except Exception:
-                        # Some axes or configs may fail here; log but continue
-                        self.log.warning(f'AMC: setControlOutput failed for axis {ax}')
+            self.sigPositionChanged.emit(dict(self._target_m))
+        except Exception:
+            pass
 
     def on_deactivate(self):
+        """
+        #Possible to disable channels
         with self._thread_lock:
             try:
                 if self._dev is not None:
                     # Try to stop outputs gracefully (optional)
                     for ax, ch in self._axis_map.items():
                         try:
-                            self._dev.control.setControlOutput(ch, False)
+                            self._dev.control.setControlOutput(ch, True)
                         except Exception:
                             pass
             finally:
@@ -182,6 +231,8 @@ class AMC300_stepper(ScanningProbeInterface):
                 except Exception:
                     pass
                 self._dev = None
+        """
+        return
 
     # ScanningProbeInterface: constraints and configuration
     @property
@@ -276,6 +327,107 @@ class AMC300_stepper(ScanningProbeInterface):
                 except Exception:
                     pos[ax] = self._target_m.get(ax, 0.0)
             return pos
+
+    # Controller closed-loop move with a single window parameter in nm
+    def move_absolute_closed_loop(
+            self,
+            position: Dict[str, float],
+            *,
+            window_nm: int,
+            timeout_s: float = 1.5,
+            disable_after: bool = True,
+            enable_output: bool = False,
+            poll_interval_s: float = 0.02,
+    ) -> Dict[str, float]:
+        """
+        Use AMC controller closed-loop to move to target(s) and stop when within window_nm.
+        - window_nm is used for BOTH:
+          • control.setControlTargetRange(axis, window_nm)        [in-target flag window]
+          • control.setMotionControlThreshold(axis, window_nm*1e3)[pm threshold]
+        - Will wait until status.getStatusTargetRange(axis) is true or timeout_s elapses.
+        - Optionally disables closed-loop afterwards.
+
+        Returns the updated target dictionary in meters.
+        """
+        with self._thread_lock:
+            dev = self._require_dev()
+            # Pre-configure each requested axis and command target
+            for ax, tgt_m in position.items():
+                ch = self._axis_to_channel(ax)
+
+                # Enable output (relay) if requested
+                if enable_output:
+                    try:
+                        dev.control.setControlOutput(ch, True)
+                    except Exception:
+                        self.log.warning(f'AMC: setControlOutput failed for axis {ax}')
+
+                # Set controller windows (range in nm; threshold in pm)
+                try:
+                    dev.control.setControlTargetRange(ch, int(window_nm))
+                except Exception:
+                    self.log.warning(f'AMC: setControlTargetRange failed for axis {ax}')
+                try:
+                    dev.control.setMotionControlThreshold(ch, int(window_nm) * 1000)
+                except Exception:
+                    self.log.warning(f'AMC: setMotionControlThreshold failed for axis {ax}')
+
+                # Enable closed-loop approach
+                try:
+                    dev.control.setControlMove(ch, True)
+                except Exception:
+                    self.log.warning(f'AMC: setControlMove(True) failed for axis {ax}')
+
+                # Command absolute target in nm
+                tgt_m = self._clip(ax, float(tgt_m))
+                tgt_nm = float(tgt_m * 1e9)
+                try:
+                    dev.move.setControlTargetPosition(ch, tgt_nm)
+                except Exception as exc:
+                    raise RuntimeError(f'AMC: setControlTargetPosition failed for axis {ax}') from exc
+
+                # Update local target immediately (avoid UI snap-back)
+                self._target_m[ax] = tgt_m
+
+        # Wait for all axes to be in target range or timeout
+        t0 = time.time()
+        axes = list(position.keys())
+        while True:
+            all_in = True
+            with self._thread_lock:
+                try:
+                    for ax in axes:
+                        ch = self._axis_to_channel(ax)
+                        in_range = bool(self._dev.status.getStatusTargetRange(ch))  # type: ignore
+                        if not in_range:
+                            all_in = False
+                            break
+                except Exception:
+                    # If status is unavailable, break on timeout using settle time as fallback
+                    pass
+            if all_in:
+                break
+            if time.time() - t0 > float(timeout_s):
+                self.log.debug('AMC closed-loop move: timeout waiting for target range.')
+                break
+            time.sleep(float(poll_interval_s))
+
+        # Optionally disable controller closed-loop
+        if disable_after:
+            with self._thread_lock:
+                for ax in axes:
+                    ch = self._axis_to_channel(ax)
+                    try:
+                        self._dev.control.setControlMove(ch, False)  # type: ignore
+                    except Exception:
+                        pass
+
+        # Notify listeners and return
+        try:
+            self.sigPositionChanged.emit(dict(self._target_m))
+        except Exception:
+            pass
+        return dict(self._target_m)
 
     # Scan lifecycle (not used here)
     def start_scan(self) -> None:
