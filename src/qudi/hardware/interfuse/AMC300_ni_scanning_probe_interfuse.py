@@ -96,6 +96,8 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         scanner.set_scan_motion_mode('per_pixel_closed_loop')  # mode of scanning: 'linewise_open_fast' or 'per_pixel_closed_loop'
         scanner.set_calibration_window_nm(300)              # int value in nm; target range for calibration move
         scanner.set_scan_closed_loop_timeout_s(5)           # how long the scanner has time to move to target range in scans
+
+        scanner.set_follow_gui_cursor_moves(False)          # Disable cursor movements (still allows scans) Default True
     """
 
     _threaded = True
@@ -121,6 +123,7 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
     _closed_loop_window_nm: int = ConfigOption('closed_loop_window_nm', default=200, missing='nothing')
     _closed_loop_timeout_s: float = ConfigOption('closed_loop_timeout_s', default=1.5, missing='nothing')
     _closed_loop_disable_after: bool = ConfigOption('closed_loop_disable_after', default=True, missing='nothing')
+    _follow_gui_cursor_moves: bool = ConfigOption('follow_gui_cursor_moves', default=True, missing='nothing')
 
     # Closed-loop parameters for per-pixel scan moves
     _scan_cl_timeout_s: float = ConfigOption('scan_closed_loop_timeout_s', default=2.0, missing='nothing')
@@ -351,18 +354,32 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         is_module_thread = (self.thread() is QtCore.QThread.currentThread())
         # For interactive GUI drags (non-blocking), defer the actual hardware move
         if (
-                self._defer_cursor_moves
-                and not blocking
+                not blocking
                 and not self._scan_intent
                 and not is_module_thread
         ):
+            # If following GUI cursor is enabled, keep existing deferred behavior
+            if self._defer_cursor_moves and self._follow_gui_cursor_moves:
+                try:
+                    self._sigDeferredMoveRequested.emit(dict(position))
+                except Exception:
+                    # if anything goes wrong, fall back to immediate move
+                    return self._motion().move_absolute(position, velocity=velocity, blocking=blocking)
+                # Return the requested target so GUI/logic won’t snap back while we defer the hardware move
+                return dict(position)
+
+            # Otherwise: update the cursor only (no hardware movement)
+            if not self._ui_target:
+                try:
+                    self._ui_target = dict(self._motion().get_target())
+                except Exception:
+                    self._ui_target = {}
+            for ax, val in position.items():
+                self._ui_target[ax] = float(val)
             try:
-                # hand off to module thread; will update shadow target and start debounce
-                self._sigDeferredMoveRequested.emit(dict(position))
+                self.sigPositionChanged.emit(dict(self._ui_target))
             except Exception:
-                # if anything goes wrong, fall back to immediate move
-                return self._motion().move_absolute(position, velocity=velocity, blocking=blocking)
-            # Return the requested target so GUI/logic won’t snap back while we defer the hardware move
+                pass
             return dict(position)
 
         return self._motion().move_absolute(position, velocity=velocity, blocking= blocking)
@@ -410,6 +427,12 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
 
         # Coalesce pending move; restart debounce
         self._pending_move_target = dict(self._ui_target)
+
+        if not self._follow_gui_cursor_moves:
+            # Do not actually start a deferred hardware move
+            self._pending_move_target = None
+            return
+
         if self._move_debounce_timer is not None:
             self._move_debounce_timer.start(int(self._cursor_move_debounce_ms))
 
@@ -426,6 +449,9 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         """ As soon as the timer finishes, the attocubes move to pending target position.
             """
         if self._pending_move_target is None:
+            return
+        if not self._follow_gui_cursor_moves:
+            self._pending_move_target = None
             return
         # Do not interfere with scans
         if self.is_scan_running or self._scan_intent:
@@ -1154,3 +1180,21 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
     def get_scan_closed_loop_timeout_s(self) -> float:
         """Return the current timeout (seconds) used for closed-loop moves during scanning."""
         return float(self._scan_cl_timeout_s)
+
+    def set_follow_gui_cursor_moves(self, enabled: bool) -> None:
+        """
+        Enable/disable hardware following non-blocking GUI cursor moves.
+        When disabled, the hardware will not move for GUI-driven, non-blocking move_absolute calls.
+        """
+        self._follow_gui_cursor_moves = bool(enabled)
+        if not self._follow_gui_cursor_moves:
+            # Cancel any pending deferred move
+            try:
+                self._sigCancelDeferredMove.emit()
+            except Exception:
+                pass
+        self.log.info(f'follow_gui_cursor_moves set to {self._follow_gui_cursor_moves}')
+
+    def get_follow_gui_cursor_moves(self) -> bool:
+        """Return whether hardware follows non-blocking GUI cursor moves."""
+        return bool(self._follow_gui_cursor_moves)
