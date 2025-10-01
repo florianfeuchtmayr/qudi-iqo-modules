@@ -85,10 +85,17 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                 scan_motion_mode: linewise_open_fast       # or 'per_pixel_closed_loop' (default)
                 calibration_window_nm: 500                 # optional, nm window for calibration approach
 
-    Change motion mode in Qudi console as follows:
+    Change config in Qudi console as follows:
 
-        scanner = amc300_ni_scanner  # from config
-        scanner.set_scan_motion_mode('linewise_open_fast')  # or 'per_pixel_closed_loop'
+        scanner = amc300_ni_scanner             # from config
+
+        scanner.set_closed_loop_timeout_s(5)    # how long the scanner has time to move to target range
+        scanner.set_cursor_move_debounce_ms(350)# how long after last cursor movement the deferred move is performed
+        scanner.set_closed_loop_window_nm(300)  # size of the target range for deferred move
+
+        scanner.set_scan_motion_mode('per_pixel_closed_loop')  # mode of scanning: 'linewise_open_fast' or 'per_pixel_closed_loop'
+        scanner.set_calibration_window_nm(300)              # int value in nm; target range for calibration move
+        scanner.set_scan_closed_loop_timeout_s(5)           # how long the scanner has time to move to target range in scans
     """
 
     _threaded = True
@@ -1093,3 +1100,57 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
     def get_closed_loop_window_nm(self) -> int:
         """Return the current cursor closed-loop target window (in nm)."""
         return int(self._closed_loop_window_nm)
+
+    def set_cursor_move_debounce_ms(self, ms: int) -> None:
+        """
+        Set the debounce time (milliseconds) for deferred cursor/slider moves.
+        """
+        try:
+            val = int(ms)
+        except Exception as exc:
+            raise ValueError('ms must be an integer (milliseconds).') from exc
+        if val < 0:
+            raise ValueError('ms must be >= 0.')
+        self._cursor_move_debounce_ms = val
+        # If a deferred move is currently pending, the new value will be used on the next start()
+        self.log.info(f'Cursor move debounce set to {self._cursor_move_debounce_ms} ms')
+
+    def get_cursor_move_debounce_ms(self) -> int:
+        """Return the current debounce time (milliseconds) for deferred cursor moves."""
+        return int(self._cursor_move_debounce_ms)
+
+    def set_closed_loop_timeout_s(self, timeout_s: float) -> None:
+        """
+        Set the timeout (seconds) for deferred cursor closed-loop moves.
+        This affects only the cursor's closed-loop path, not scanning.
+        """
+        try:
+            val = float(timeout_s)
+        except Exception as exc:
+            raise ValueError('timeout_s must be a number (seconds).') from exc
+        if val <= 0:
+            raise ValueError('timeout_s must be > 0.')
+        self._closed_loop_timeout_s = val
+        self.log.info(f'Cursor closed-loop timeout set to {self._closed_loop_timeout_s} s')
+
+    def get_closed_loop_timeout_s(self) -> float:
+        """Return the current timeout (seconds) for cursor closed-loop moves."""
+        return float(self._closed_loop_timeout_s)
+
+    def set_scan_closed_loop_timeout_s(self, timeout_s: float) -> None:
+        """
+        Set the timeout (seconds) used for closed-loop moves during scanning
+        (e.g., per-pixel CL or line-start CL in linewise mode).
+        """
+        try:
+            val = float(timeout_s)
+        except Exception as exc:
+            raise ValueError('timeout_s must be a number (seconds).') from exc
+        if val <= 0:
+            raise ValueError('timeout_s must be > 0.')
+        self._scan_cl_timeout_s = val
+        self.log.info(f'Scan closed-loop timeout set to {self._scan_cl_timeout_s} s')
+
+    def get_scan_closed_loop_timeout_s(self) -> float:
+        """Return the current timeout (seconds) used for closed-loop moves during scanning."""
+        return float(self._scan_cl_timeout_s)
