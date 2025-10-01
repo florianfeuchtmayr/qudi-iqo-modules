@@ -487,3 +487,94 @@ class AMC300_stepper(ScanningProbeInterface):
                 self.log.warning(f'AMC axis {axis}: wait idle timeout.')
                 return
             time.sleep(0.002)
+
+    def set_step_size_m(self, axis: str, step_size_m: float) -> None:
+        """Override the configured step size for an axis (meters per step)."""
+        with self._thread_lock:
+            if axis not in self._step_size_m:
+                raise KeyError(f'Unknown axis "{axis}"')
+            self._step_size_m[axis] = float(step_size_m)
+
+    def get_step_size_m(self, axis: str) -> float:
+        """Return the current (possibly overridden) step size for an axis (meters per step)."""
+        with self._thread_lock:
+            if axis not in self._step_size_m:
+                raise KeyError(f'Unknown axis "{axis}"')
+            return float(self._step_size_m[axis])
+
+    def calibration_movement(
+        self,
+        *,
+        axis: str,
+        start_m: float,
+        end_m: float,
+        window_nm: int = 200,
+        max_steps: Optional[int] = None,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 0.002,
+    ) -> Dict[str, float]:
+        """
+        Calibrate step size on a single axis by stepping from start_m to end_m while monitoring position.
+        Returns a dict {axis: measured_step_size_m}.
+        """
+        ch = self._axis_to_channel(axis)
+        window_m = float(window_nm) * 1e-9
+        with self._thread_lock:
+            dev = self._require_dev()
+
+        # 1) Closed-loop to start position (disable_after=True to avoid fighting stepping)
+        self.move_absolute_closed_loop({axis: float(start_m)}, window_nm=int(window_nm),
+                                       timeout_s=float(timeout_s), disable_after=True)
+
+        with self._thread_lock:
+            dev = self._require_dev()
+            # Read initial measured position
+            try:
+                pos_nm = float(dev.move.getPosition(ch))
+                pos_m_start = pos_nm * 1e-9
+            except Exception:
+                # If reading fails, fall back to commanded start
+                pos_m_start = float(start_m)
+
+        # 2) Step towards end_m while counting steps
+        direction_backward = end_m < pos_m_start
+        step_count = 0
+        t0 = time.time()
+        pos_m = pos_m_start
+        while abs(pos_m - float(end_m)) > window_m:
+            with self._thread_lock:
+                # Single step towards target
+                dev.move.setSingleStep(ch, bool(direction_backward))
+            step_count += 1
+
+            # Optional limiters
+            if max_steps is not None and step_count >= int(max_steps):
+                break
+            if time.time() - t0 > float(timeout_s):
+                break
+
+            time.sleep(float(poll_interval_s))
+            with self._thread_lock:
+                try:
+                    pos_nm = float(dev.move.getPosition(ch))
+                    pos_m = pos_nm * 1e-9
+                except Exception:
+                    # If read fails, continue a bit and re-check
+                    pos_m = pos_m
+
+        # Final measured position
+        with self._thread_lock:
+            try:
+                pos_nm = float(dev.move.getPosition(ch))
+                pos_m_end = pos_nm * 1e-9
+            except Exception:
+                pos_m_end = pos_m
+
+        # 3) Compute measured step size (fallback to existing if no steps)
+        measured_step = self.get_step_size_m(axis)
+        if step_count > 0:
+            delta = abs(pos_m_end - pos_m_start)
+            if delta > 0:
+                measured_step = delta / float(step_count)
+
+        return {axis: float(measured_step)}

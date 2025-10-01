@@ -61,20 +61,34 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
             module.Class: 'interfuse.AMC300_ni_scanning_probe_interfuse.AMC300NIScanningProbeInterfuse'
             connect:
                 motion: 'amc300_stepper'
-                ni_input: 'ni_streamer'
+                ni_input: 'nicard_6343_instreamer'
             options:
                 ni_channel_mapping:
                     fluorescence: 'PFI8'
                 input_channel_units:
                     fluorescence: 'c/s'
                 default_dwell_time_s: 0.5e-3    # optional if not deriving from frequency
-                ni_sample_rate_hz: 50e3         # choose ≥ 1/dwell resolution you need
-                settle_time_s: 0.001
+                ni_sample_rate_hz: 50e1         # choose ≥ 1/dwell resolution you need
+                settle_time_s: 0.001            # waiting time between pixels
                 back_scan_available: true
-                _use_closed_loop_for_deferred: true
-                _closed_loop_window_nm: 300
-                _closed_loop_timeout_s: 1.5
-                _closed_loop_disable_after: true
+
+                _defer_cursor_moves: true           #optional
+                _cursor_move_debounce_ms: 350       #optional
+                _use_closed_loop_for_deferred: true #optional
+                _closed_loop_window_nm: 300         #optional
+                _closed_loop_timeout_s: 5           #optional
+                _closed_loop_disable_after: true    #optional
+
+                scan_closed_loop_timeout_s: 5.0       # increase if moves are long
+                scan_closed_loop_disable_after: true  # disable CL after each pixel to minimize controller load
+                scan_closed_loop_enable_output: false # set true if AMC needs explicit output enable each time
+                scan_motion_mode: linewise_open_fast       # or 'per_pixel_closed_loop' (default)
+                calibration_window_nm: 500                 # optional, nm window for calibration approach
+
+    Change motion mode in Qudi console as follows:
+
+        scanner = amc300_ni_scanner  # from config
+        scanner.set_scan_motion_mode('linewise_open_fast')  # or 'per_pixel_closed_loop'
     """
 
     _threaded = True
@@ -105,6 +119,10 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
     _scan_cl_timeout_s: float = ConfigOption('scan_closed_loop_timeout_s', default=2.0, missing='nothing')
     _scan_cl_disable_after: bool = ConfigOption('scan_closed_loop_disable_after', default=True, missing='nothing')
     _scan_cl_enable_output: bool = ConfigOption('scan_closed_loop_enable_output', default=False, missing='nothing')
+    # Scan motion mode: 'per_pixel_closed_loop' (existing) or 'linewise_open_fast'
+    _scan_motion_mode: str = ConfigOption('scan_motion_mode', default='per_pixel_closed_loop', missing='warn')
+    # Calibration window for measuring step size (nm)
+    _calibration_window_nm: int = ConfigOption('calibration_window_nm', default=300, missing='nothing')
 
     # Internal state
     sigPositionChanged = QtCore.Signal(dict)
@@ -115,10 +133,10 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         super().__init__(*args, **kwargs)
 
         self._scan_settings: Optional[ScanSettings] = None
-
         self._scan_data: Optional[ScanData] = None
         self._back_scan_data: Optional[ScanData] = None
         self._constraints: Optional[ScanConstraints] = None
+        self._saved_step_size_fast: Optional[Dict[str, float]] = None
 
         self._thread_lock_data = Mutex()
 
@@ -477,6 +495,14 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
             with self._thread_lock_data:
                 # Allocate forward scan arrays
                 self._scan_data.new_scan()
+                # Stamp the chosen scan mode into metadata for traceability
+                try:
+                    # Put it into coord_transform_info to persist in ScanData
+                    self._scan_data.coord_transform_info['scan_motion_mode'] = self._scan_motion_mode
+                    if self._back_scan_data is not None:
+                        self._back_scan_data.coord_transform_info['scan_motion_mode'] = self._scan_motion_mode
+                except Exception:
+                    pass
                 # Record where we started
                 self._scan_data.scanner_target_at_start = dict(self._stored_target_pos)
 
@@ -484,6 +510,66 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                 if self._back_scan_data is not None:
                     self._back_scan_data.new_scan()
                     self._back_scan_data.scanner_target_at_start = dict(self._stored_target_pos)
+
+            # Optional: pre-scan calibration for fast axis in 'linewise_open_fast' mode
+            if self._scan_motion_mode == 'linewise_open_fast':
+                settings = self._scan_data.settings
+                axes_names = list(settings.axes)
+                fast_ax = axes_names[0]
+                # Build start and end positions (min/max along fast axis; slow axis at its start)
+                fast_min, fast_max = settings.range[0]
+                pos_start = {}
+                for i, ax in enumerate(axes_names):
+                    rng = settings.range[i]
+                    pos_start[ax] = float(rng[0])  # start at min of each scan axis
+
+                motion = self._motion()
+
+                # Closed-loop to start of scan
+                if hasattr(motion, 'move_absolute_closed_loop'):
+                    motion.move_absolute_closed_loop(
+                        pos_start,
+                        window_nm=int(self._calibration_window_nm),
+                        timeout_s=float(self._scan_cl_timeout_s),
+                        disable_after=True,
+                        enable_output=bool(self._scan_cl_enable_output),
+                    )
+                else:
+                    motion.move_absolute(pos_start, blocking=True)
+
+                # Calibration movement on fast axis: start -> end, step counting
+                if hasattr(motion, 'calibration_movement'):
+                    measured = motion.calibration_movement(
+                        axis=fast_ax,
+                        start_m=float(fast_min),
+                        end_m=float(fast_max),
+                        window_nm=int(self._calibration_window_nm),
+                        timeout_s=max(2.0, float(self._scan_cl_timeout_s)),
+                    )
+                    # Closed-loop back to start for scanning
+                    if hasattr(motion, 'move_absolute_closed_loop'):
+                        motion.move_absolute_closed_loop(
+                            pos_start,
+                            window_nm=int(self._calibration_window_nm),
+                            timeout_s=float(self._scan_cl_timeout_s),
+                            disable_after=True,
+                            enable_output=bool(self._scan_cl_enable_output),
+                        )
+                    else:
+                        motion.move_absolute(pos_start, blocking=True)
+
+                    # Save and override fast-axis step size (restored in _stop_scan)
+                    try:
+                        original = motion.get_step_size_m(fast_ax)
+                        self._saved_step_size_fast = {fast_ax: original}
+                        motion.set_step_size_m(fast_ax, float(measured[fast_ax]))
+                        self.log.debug(f"Fast axis '{fast_ax}' calibrated step size: "
+                                       f"{measured[fast_ax]:.3e} m/step (was {original:.3e})")
+                    except Exception:
+                        self.log.exception('Failed to override fast axis step size after calibration.')
+                else:
+                    self.log.warning('Motion module does not provide calibration_movement(); '
+                                     'skipping fast-axis calibration.')
 
             # Start NI stream now
             try:
@@ -536,6 +622,7 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         if thr is not None and thr.is_alive():
             thr.join(timeout=5.0)
         self._worker_thread = None
+
         # Stop NI stream
         try:
             self._ni_in().stop_stream()
@@ -564,6 +651,17 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
             self.sigPositionChanged.emit(dict(self._ui_target))
         except Exception:
             pass
+
+        # Restore fast-axis step size if overridden
+        try:
+            if self._saved_step_size_fast:
+                for ax, val in self._saved_step_size_fast.items():
+                    try:
+                        self._motion().set_step_size_m(ax, float(val))
+                    except Exception:
+                        pass
+        finally:
+            self._saved_step_size_fast = None
 
     def emergency_stop(self) -> None:
 
@@ -611,15 +709,22 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
 
     # Worker: software-stepped scan
     def _run_scan_worker(self):
-        """Worker during the step-scan.
-            Each pixel is approached with a closed loop movement."""
+        """
+        Worker during the step-scan.
+
+        Two motion modes are supported:
+        - 'per_pixel_closed_loop' (default): closed-loop to every pixel
+        - 'linewise_open_fast': closed-loop at the start of each line, open-loop along fast axis pixels
+
+        Data acquisition uses the NI streamer and writes directly into ScanData.data arrays.
+        """
         try:
             settings = self._scan_data.settings if self._scan_data else None
             data = self._scan_data
             if settings is None or data is None:
                 raise RuntimeError('Scan not configured')
 
-            # Axis vectors from settings
+            # Build axis vectors from settings
             axes_names = list(settings.axes)
             axis_values: List[np.ndarray] = []
             for i, ax in enumerate(axes_names):
@@ -627,37 +732,32 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                 n = int(settings.resolution[i])
                 axis_values.append(np.linspace(float(mn), float(mx), n))
 
+            # Dynamic closed-loop window (nm) from pixel pitch (use max across axes)
             pixel_sizes_m: List[float] = []
             for i, ax in enumerate(axes_names):
                 mn, mx = settings.range[i]
                 n = int(settings.resolution[i])
                 steps = max(n - 1, 1)
                 pixel_sizes_m.append(abs(float(mx) - float(mn)) / steps)
-            # Use the max pixel pitch across axes so window covers both fast/slow steps
             cl_window_nm = max(1, int(round(max(pixel_sizes_m) * 1e9)))
 
-            # Pixel iterator (row-major)
-            mesh = np.meshgrid(*axis_values, indexing='ij')
-            coords_stack = np.stack([m.reshape(-1) for m in mesh], axis=1)
-
             # Dwell and sampling
-            dwell_s = 1.0 / float(settings.frequency) if settings.frequency > 0 else self._default_dwell_time_s
+            if settings.frequency <= 0:
+                raise ValueError('Scan frequency must be > 0. Set it in the Scanner GUI.')
+            dwell_s = 1.0 / float(settings.frequency)
             ni: DataInStreamInterface = self._ni_in()
             sample_rate = float(self._ni_sample_rate_hz)
             samples_per_pixel = max(1, int(round(sample_rate * dwell_s)))
 
-            # Determine buffer dtype (fallback to float64 if not provided)
+            # Determine buffer dtype and active channel order on device
             buf_dtype = getattr(getattr(ni, 'constraints', object()), 'data_type', np.float64)
-
-            # Get active NI channels from the streamer (true order on device)
             try:
                 active_ni_channels = list(ni.get_active_channels())
             except Exception:
                 active_ni_channels = list(self._ni_channels_in_order)
-
             stream_ch_count = max(1, len(active_ni_channels))
 
-            # Map presented aliases -> active stream index
+            # Map presented alias -> active stream index
             present_to_active_idx: Dict[str, int] = {}
             for alias in self._present_channels:
                 ni_name = self._present_to_ni.get(alias)
@@ -667,65 +767,35 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                     present_to_active_idx[alias] = -1
                     self.log.warning(f'NI channel {ni_name} for {alias} is not active in streamer.')
 
-            for pix_idx, coord in enumerate(coords_stack):
-                if self._stop_requested:
-                    break
-
-                # Move to pixel (blocking), settle
-                pos = {ax: float(coord[i]) for i, ax in enumerate(axes_names)}
-                motion = self._motion()
-
-                # Per-pixel closed-loop approach for robust positioning
-                if hasattr(motion, 'move_absolute_closed_loop'):
-                    try:
-                        motion.move_absolute_closed_loop(
-                            pos,
-                            window_nm=int(cl_window_nm),
-                            timeout_s=float(self._scan_cl_timeout_s),
-                            disable_after=bool(self._scan_cl_disable_after),
-                            enable_output=bool(self._scan_cl_enable_output),
-                        )
-                    except Exception:
-                        # Fallback to standard blocking move if CL fails
-                        motion.move_absolute(pos, blocking=True)
-                else:
-                    # Fallback if backend has no CL API
-                    motion.move_absolute(pos, blocking=True)
-
-                # Small settle delay (can be reduced when CL is reliable)
-                time.sleep(self._settle_time_s)
-
-                # Acquire NI samples for this pixel
+            # Local helper: read one pixel worth of data and aggregate per presented channel
+            def _acquire_and_aggregate() -> Dict[str, float]:
                 channel_means: Dict[str, float] = {}
-
                 samples_obj = None
+                # Preferred dict/list/array API
                 if hasattr(ni, 'read_data'):
                     try:
-                        # May return dict, list/tuple of arrays, or ndarray
                         samples_obj = ni.read_data(samples_per_channel=samples_per_pixel)
                     except Exception:
-                        samples_obj = None  # will fall back to buffer API
+                        samples_obj = None
 
                 if isinstance(samples_obj, dict):
-                    # Dict keyed by channel name or index
                     for alias in self._present_channels:
                         ni_name = self._present_to_ni.get(alias)
                         arr = None
                         if ni_name in samples_obj:
                             arr = np.asarray(samples_obj[ni_name])
                         else:
-                            # Try by index key
                             idx = present_to_active_idx.get(alias, -1)
-                            if idx >= 0 and idx in samples_obj:
+                            if idx in samples_obj:
                                 arr = np.asarray(samples_obj[idx])
                         if arr is None:
                             channel_means[alias] = np.nan
                         else:
                             unit = self._input_channel_units.get(alias, '')
                             channel_means[alias] = float(np.sum(arr)) if unit == 'c/s' else float(np.mean(arr))
+                    return channel_means
 
-                elif isinstance(samples_obj, (list, tuple)):
-                    # Sequence of per-channel arrays in active channel order
+                if isinstance(samples_obj, (list, tuple)):
                     for alias in self._present_channels:
                         idx = present_to_active_idx.get(alias, -1)
                         if idx < 0 or idx >= len(samples_obj):
@@ -734,14 +804,13 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                         arr = np.asarray(samples_obj[idx])
                         unit = self._input_channel_units.get(alias, '')
                         channel_means[alias] = float(np.sum(arr)) if unit == 'c/s' else float(np.mean(arr))
+                    return channel_means
 
-                elif isinstance(samples_obj, np.ndarray):
-                    # ndarray: could be 2D (ch x samples) or (samples x ch) or 1D interleaved
+                if isinstance(samples_obj, np.ndarray):
                     arr = np.asarray(samples_obj)
                     if arr.ndim == 2:
-                        ch_first = (arr.shape[0], arr.shape[1])  # (rows, cols)
-                        if ch_first[0] == stream_ch_count and ch_first[1] == samples_per_pixel:
-                            # shape: (channels, samples)
+                        # (channels, samples) or (samples, channels)
+                        if arr.shape == (stream_ch_count, samples_per_pixel):
                             for alias in self._present_channels:
                                 idx = present_to_active_idx.get(alias, -1)
                                 if idx < 0 or idx >= stream_ch_count:
@@ -751,8 +820,8 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                                 unit = self._input_channel_units.get(alias, '')
                                 channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(
                                     np.mean(ch_slice))
-                        elif ch_first[1] == stream_ch_count and ch_first[0] == samples_per_pixel:
-                            # shape: (samples, channels)
+                            return channel_means
+                        if arr.shape == (samples_per_pixel, stream_ch_count):
                             for alias in self._present_channels:
                                 idx = present_to_active_idx.get(alias, -1)
                                 if idx < 0 or idx >= stream_ch_count:
@@ -762,68 +831,177 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                                 unit = self._input_channel_units.get(alias, '')
                                 channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(
                                     np.mean(ch_slice))
-                        else:
-                            # Unexpected 2D shape; fall back to buffer API
-                            samples_obj = None
-                    elif arr.ndim == 1:
-                        # 1D interleaved: length should be stream_ch_count * samples_per_pixel
-                        if arr.size == stream_ch_count * samples_per_pixel:
-                            for alias in self._present_channels:
-                                idx = present_to_active_idx.get(alias, -1)
-                                if idx < 0 or idx >= stream_ch_count:
-                                    channel_means[alias] = np.nan
-                                    continue
-                                ch_slice = arr[idx::stream_ch_count][:samples_per_pixel]
-                                unit = self._input_channel_units.get(alias, '')
-                                channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(
-                                    np.mean(ch_slice))
-                        else:
-                            # Unexpected size; fall back to buffer API
-                            samples_obj = None
-                    else:
-                        samples_obj = None  # fallback
+                            return channel_means
+                        # Unexpected 2D shape → fall through to buffer API
+                    elif arr.ndim == 1 and arr.size == stream_ch_count * samples_per_pixel:
+                        # Interleaved 1D
+                        for alias in self._present_channels:
+                            idx = present_to_active_idx.get(alias, -1)
+                            if idx < 0 or idx >= stream_ch_count:
+                                channel_means[alias] = np.nan
+                                continue
+                            ch_slice = arr[idx::stream_ch_count][:samples_per_pixel]
+                            unit = self._input_channel_units.get(alias, '')
+                            channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(
+                                np.mean(ch_slice))
+                        return channel_means
+                    # Else: fall through to buffer API
 
-                if samples_obj is None:
-                    # Buffer API fallback: interleaved data for all active channels
-                    interleaved = np.zeros(stream_ch_count * samples_per_pixel, dtype=buf_dtype)
+                # Buffer API fallback: interleaved for all active channels
+                interleaved = np.zeros(stream_ch_count * samples_per_pixel, dtype=buf_dtype)
+                try:
+                    ni.read_data_into_buffer(interleaved, samples_per_channel=samples_per_pixel)
+                except Exception:
+                    self.log.exception('Getting samples from streamer failed. Stopping streamer.')
                     try:
-                        ni.read_data_into_buffer(interleaved, samples_per_channel=samples_per_pixel)
+                        ni.stop_stream()
                     except Exception:
-                        self.log.exception('Getting samples from streamer failed. Stopping streamer.')
-                        try:
-                            ni.stop_stream()
-                        except Exception:
-                            pass
-                        raise
+                        pass
+                    raise
+                for alias in self._present_channels:
+                    idx = present_to_active_idx.get(alias, -1)
+                    if idx < 0 or idx >= stream_ch_count:
+                        channel_means[alias] = np.nan
+                        continue
+                    ch_slice = interleaved[idx::stream_ch_count][:samples_per_pixel]
+                    unit = self._input_channel_units.get(alias, '')
+                    channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(np.mean(ch_slice))
+                return channel_means
 
-                    for alias in self._present_channels:
-                        idx = present_to_active_idx.get(alias, -1)
-                        if idx < 0 or idx >= stream_ch_count:
-                            channel_means[alias] = np.nan
-                            continue
-                        ch_slice = interleaved[idx::stream_ch_count][:samples_per_pixel]
-                        unit = self._input_channel_units.get(alias, '')
-                        channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(np.mean(ch_slice))
+            # Motion and scan geometry shortcuts
+            motion = self._motion()
+            fast_ax = axes_names[0]  # x = fast
+            nx = int(settings.resolution[0])
+            fast_vals = axis_values[0]
+            is_2d = (len(axes_names) == 2)
+            if is_2d:
+                slow_ax = axes_names[1]  # y = slow
+                ny = int(settings.resolution[1])
+                slow_vals = axis_values[1]
 
-                # Order counts as presented
-                counts = [channel_means.get(alias, np.nan) for alias in self._present_channels]
-
-                # Write pixel directly into ScanData arrays
-                # Compute multi-index for this pixel in C-order (row-major) matching coords_stack enumeration
-                idx_tuple = np.unravel_index(pix_idx, settings.resolution, order='C')
-
-                # Access backing arrays via the data property (returns references to internal arrays)
+            # Branch on scan motion mode
+            if self._scan_motion_mode == 'linewise_open_fast':
+                # Direct array access (writes in-place)
                 data_dict = data.data
                 if data_dict is None:
                     raise RuntimeError('ScanData.data not initialized. Did you call data.new_scan()?')
 
-                # Fill per presented channel if it exists in ScanData
-                for ch_name, val in zip(self._present_channels, counts):
-                    arr = data_dict.get(ch_name)
-                    if arr is not None:
-                        arr[idx_tuple] = val
+                if not is_2d:
+                    # 1D: assume we are already at first pixel (calibration positioned us there).
+                    for p in range(nx):
+                        if self._stop_requested:
+                            break
+                        # Open-loop absolute move for p>0
+                        if p > 0:
+                            motion.move_absolute({fast_ax: float(fast_vals[p])}, blocking=True)
+                            time.sleep(self._settle_time_s)
 
-            # Finish scans (tolerate older APIs)
+                        # Acquire and write
+                        ch_means = _acquire_and_aggregate()
+                        counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
+                        idx_tuple = (p,)
+                        for ch_name, val in zip(self._present_channels, counts):
+                            arr = data_dict.get(ch_name)
+                            if arr is not None:
+                                arr[idx_tuple] = val
+
+                else:
+                    # 2D: for each line, closed-loop to line start; then open-loop pixels on fast axis
+                    for l in range(ny):
+                        if self._stop_requested:
+                            break
+                        pos_line_start = {fast_ax: float(fast_vals[0]), slow_ax: float(slow_vals[l])}
+                        if hasattr(motion, 'move_absolute_closed_loop'):
+                            motion.move_absolute_closed_loop(
+                                pos_line_start,
+                                window_nm=int(cl_window_nm),
+                                timeout_s=float(self._scan_cl_timeout_s),
+                                disable_after=True,
+                                enable_output=bool(self._scan_cl_enable_output),
+                            )
+                        else:
+                            motion.move_absolute(pos_line_start, blocking=True)
+                        time.sleep(self._settle_time_s)
+
+                        for p in range(nx):
+                            if self._stop_requested:
+                                break
+                            if p > 0:
+                                motion.move_absolute({fast_ax: float(fast_vals[p])}, blocking=True)
+                                time.sleep(self._settle_time_s)
+                            # Acquire and write
+                            ch_means = _acquire_and_aggregate()
+                            counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
+                            idx_tuple = (p, l)  # x-fast, y-slow
+                            for ch_name, val in zip(self._present_channels, counts):
+                                arr = data_dict.get(ch_name)
+                                if arr is not None:
+                                    arr[idx_tuple] = val
+
+            else:
+                # 'per_pixel_closed_loop' (now also x-fast, y-slow when 2D)
+                data_dict = data.data
+                if data_dict is None:
+                    raise RuntimeError('ScanData.data not initialized. Did you call data.new_scan()?')
+
+                if not is_2d:
+                    for p in range(nx):
+                        if self._stop_requested:
+                            break
+                        pos = {fast_ax: float(fast_vals[p])}
+                        if hasattr(motion, 'move_absolute_closed_loop'):
+                            try:
+                                motion.move_absolute_closed_loop(
+                                    pos,
+                                    window_nm=int(cl_window_nm),
+                                    timeout_s=float(self._scan_cl_timeout_s),
+                                    disable_after=bool(self._scan_cl_disable_after),
+                                    enable_output=bool(self._scan_cl_enable_output),
+                                )
+                            except Exception:
+                                motion.move_absolute(pos, blocking=True)
+                        else:
+                            motion.move_absolute(pos, blocking=True)
+                        time.sleep(self._settle_time_s)
+
+                        ch_means = _acquire_and_aggregate()
+                        counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
+                        idx_tuple = (p,)
+                        for ch_name, val in zip(self._present_channels, counts):
+                            arr = data_dict.get(ch_name)
+                            if arr is not None:
+                                arr[idx_tuple] = val
+
+                else:
+                    for l in range(ny):  # slow axis outer
+                        for p in range(nx):  # fast axis inner
+                            if self._stop_requested:
+                                break
+                            pos = {fast_ax: float(fast_vals[p]), slow_ax: float(slow_vals[l])}
+                            if hasattr(motion, 'move_absolute_closed_loop'):
+                                try:
+                                    motion.move_absolute_closed_loop(
+                                        pos,
+                                        window_nm=int(cl_window_nm),
+                                        timeout_s=float(self._scan_cl_timeout_s),
+                                        disable_after=bool(self._scan_cl_disable_after),
+                                        enable_output=bool(self._scan_cl_enable_output),
+                                    )
+                                except Exception:
+                                    motion.move_absolute(pos, blocking=True)
+                            else:
+                                motion.move_absolute(pos, blocking=True)
+                            time.sleep(self._settle_time_s)
+
+                            ch_means = _acquire_and_aggregate()
+                            counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
+                            idx_tuple = (p, l)  # x-fast, y-slow
+                            for ch_name, val in zip(self._present_channels, counts):
+                                arr = data_dict.get(ch_name)
+                                if arr is not None:
+                                    arr[idx_tuple] = val
+
+            # Finish scans
             try:
                 data.finish_scan()
             except Exception:
@@ -862,3 +1040,56 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         else:
             with self._thread_lock_data:
                 return self._back_scan_data.copy()
+
+    def set_scan_motion_mode(self, mode: str) -> None:
+        """
+        Set the scan motion mode at runtime.
+        Allowed values:
+            - 'per_pixel_closed_loop'
+            - 'linewise_open_fast'
+        """
+        mode = str(mode).strip()
+        if mode not in ('per_pixel_closed_loop', 'linewise_open_fast'):
+            raise ValueError("scan_motion_mode must be 'per_pixel_closed_loop' or 'linewise_open_fast'")
+        self._scan_motion_mode = mode
+        self.log.info(f"Scan motion mode set to: {self._scan_motion_mode}")
+
+    def get_scan_motion_mode(self) -> str:
+        """Return the current scan motion mode."""
+        return str(self._scan_motion_mode)
+
+    def set_calibration_window_nm(self, window_nm: int) -> None:
+        """
+        Set the calibration closed-loop target window (in nm) used during the pre-scan
+        calibration in 'linewise_open_fast' mode.
+        """
+        try:
+            w = int(window_nm)
+        except Exception as exc:
+            raise ValueError('window_nm must be an integer (nanometers).') from exc
+        if w <= 0:
+            raise ValueError('window_nm must be > 0 nm.')
+        self._calibration_window_nm = w
+        self.log.info(f'Calibration window set to {self._calibration_window_nm} nm')
+
+    def get_calibration_window_nm(self) -> int:
+        """Return the current calibration closed-loop target window (in nm)."""
+        return int(self._calibration_window_nm)
+
+    def set_closed_loop_window_nm(self, window_nm: int) -> None:
+        """
+        Set the closed-loop target window (in nm) used for deferred cursor moves.
+        This does NOT affect the scanning closed-loop window, which is computed dynamically per pixel.
+        """
+        try:
+            w = int(window_nm)
+        except Exception as exc:
+            raise ValueError('window_nm must be an integer (nanometers).') from exc
+        if w <= 0:
+            raise ValueError('window_nm must be > 0 nm.')
+        self._closed_loop_window_nm = w
+        self.log.info(f'Cursor closed-loop window set to {self._closed_loop_window_nm} nm')
+
+    def get_closed_loop_window_nm(self) -> int:
+        """Return the current cursor closed-loop target window (in nm)."""
+        return int(self._closed_loop_window_nm)
