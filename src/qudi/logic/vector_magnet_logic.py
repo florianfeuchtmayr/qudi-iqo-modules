@@ -93,6 +93,7 @@ class VectorMagnetLogic(Base):
     # -------------- Lifecycle --------------
     def on_activate(self):
         hw = self.hardware()
+        hw.sigCommunicationError.connect(lambda msg: self._log("HW_COMM " + msg))
         # Pull calibration & constraints
         self._M_diag = dict(hw._cal_diag)
         self._Minv_diag = {ax: 1.0 / v for ax, v in self._M_diag.items()}
@@ -239,11 +240,22 @@ class VectorMagnetLogic(Base):
         # Provide ramp commands (native) or fallback
         if hw._use_native_sweep:
             for ax in ('x','y','z'):
-                current_now = hw.get_axis_current(ax, fresh=True)
+                current_now = hw.get_axis_current(ax, fresh=False)
+                # If we have no cached value yet (nan), skip now; ramp will be scheduled after first poll.
+                if math.isnan(current_now):
+                    continue
                 tgt = self._target_currents[ax]
                 if abs(tgt - current_now) > self._current_tolerance_A:
                     self._ramping_axes.add(ax)
                     hw.start_axis_sweep(ax, tgt, fast=fast)
+            if not self._ramping_axes:
+                # Defer if data not ready yet
+                if any(math.isnan(hw.get_axis_current(a, fresh=False)) for a in ('x', 'y', 'z')):
+                    QtCore.QTimer.singleShot(250, lambda: self._begin_ramps(fast=fast))
+                    return
+                self._post_ramp_finalize()
+                return
+
             if self._ramping_axes:
                 self._ramp_progress_timer.start()
             else:

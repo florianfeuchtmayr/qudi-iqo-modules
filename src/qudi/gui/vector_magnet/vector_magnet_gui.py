@@ -88,24 +88,48 @@ class VectorMagnetGui(GuiBase):
         self._fast_sweep_enabled = False
 
     # ---------------- Actions ----------------
+    # Add inside VectorMagnetGui class (e.g. above _apply_cartesian)
+    def _val_or_zero(self, line_edit: QtWidgets.QLineEdit) -> float:
+        txt = line_edit.text().strip()
+        if not txt:
+            return 0.0
+        try:
+            return float(txt.replace(',', '.'))
+        except ValueError:
+            raise ValueError(f'Invalid number: "{txt}"')
+
+    def _status_message(self, msg: str):
+        self._widget.statusLabel.setText(msg)
+        print("VectorMagnetGui:", msg)  # DEBUG — remove later
+
+    # Replace the existing _apply_cartesian with this:
     def _apply_cartesian(self):
         try:
-            Bx = float(self._widget.bxEdit.text())
-            By = float(self._widget.byEdit.text())
-            Bz = float(self._widget.bzEdit.text())
+            Bx = self._val_or_zero(self._widget.bxEdit)
+            By = self._val_or_zero(self._widget.byEdit)
+            Bz = self._val_or_zero(self._widget.bzEdit)
         except ValueError:
             self._status_message("Invalid Cartesian field input.")
             return
+        # If all three empty -> no-op
+        if Bx == By == Bz == 0.0 and not any(
+                e.text().strip() for e in (self._widget.bxEdit,
+                                           self._widget.byEdit,
+                                           self._widget.bzEdit)):
+            self._status_message("No values entered.")
+            return
+        self._status_message(f"Requesting field (mT): {Bx},{By},{Bz}")
         self.logic().request_set_field_cartesian(Bx, By, Bz, fast=self._fast_sweep_enabled)
 
     def _apply_spherical(self):
         try:
-            Bmag = float(self._widget.bmagEdit.text())
-            theta = float(self._widget.thetaEdit.text())
-            phi = float(self._widget.phiEdit.text())
+            Bmag = self._val_or_zero(self._widget.bmagEdit)
+            theta = self._val_or_zero(self._widget.thetaEdit)
+            phi = self._val_or_zero(self._widget.phiEdit)
         except ValueError:
             self._status_message("Invalid spherical field input.")
             return
+        self._status_message(f"Requesting spherical |B|={Bmag}mT θ={theta}° φ={phi}°")
         self.logic().request_set_field_spherical(Bmag, theta, phi, fast=self._fast_sweep_enabled)
 
     def _persistent_toggled(self, checked: bool):

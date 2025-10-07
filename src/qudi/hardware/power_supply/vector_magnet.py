@@ -1,56 +1,52 @@
 # -*- coding: utf-8 -*-
 """
-Hardware composite driver for a 3-axis vector superconducting magnet powered by:
- - One dual Cryomagnetics 4G supply (X and Y channels selected via CHAN 1/2)
- - One single Cryomagnetics 4G supply (Z)
-
-Implements:
- - Native sweep control (ULIM/LLIM + SWEEP UP/DOWN/ZERO)
- - Heater control (PSHTR ON/OFF) for dual block and single supply
- - Periodic polling (Iout, Imag, Sweep, PSHTR)
- - Quench detection (non-interference)
- - Emergency zero sweep
-
-Non-blocking design: Polling runs in a thread; all device I/O serialized with a Mutex.
-
-NOTE:
- If your environment already provides a generic serial abstraction inside Qudi, replace
- the _SerialPortWrapper with that abstraction.
-
-Author: Generated for your lab (2025)
+Vector Magnet Hardware Driver – production version
 """
+
 from __future__ import annotations
 import time
 import threading
 import re
-import os
+import math
 from typing import Dict, Optional, Any
 from PySide2 import QtCore
-from qudi.core.module import Base
 from qudi.core.configoption import ConfigOption
 from qudi.util.mutex import Mutex
-
 from qudi.interface.vector_magnet_interface import VectorMagnetHardwareInterface
 
 try:
-    import serial  # pyserial
+    import serial
 except ImportError:
     serial = None
 
 
 class _SerialPortWrapper:
-    """Minimal serial port wrapper to allow easy substitution if Qudi has a base class."""
     def __init__(self, port: str, baudrate: int, timeout: float = 1.0):
         if serial is None:
-            raise RuntimeError("pyserial not installed. Please 'pip install pyserial'.")
-        self._ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout, write_timeout=1.0)
+            raise RuntimeError("pyserial not installed. Run 'pip install pyserial'.")
+        self._ser = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            timeout=timeout,
+            write_timeout=1.0,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            rtscts=False,
+            dsrdtr=False
+        )
 
-    def write_line(self, line: str):
-        self._ser.write(line.encode('ascii', errors='ignore'))
+    def write_bytes(self, data: bytes):
+        self._ser.write(data)
 
-    def readline(self) -> str:
-        raw = self._ser.readline()
-        return raw.decode('ascii', errors='ignore')
+    def in_waiting(self) -> int:
+        return self._ser.in_waiting
+
+    def read(self, n: int) -> bytes:
+        return self._ser.read(n)
+
+    def reset_input_buffer(self):
+        self._ser.reset_input_buffer()
 
     def close(self):
         try:
@@ -60,40 +56,11 @@ class _SerialPortWrapper:
 
 
 class VectorMagnetHardware(VectorMagnetHardwareInterface):
-    """
-    Exports signals consumed by logic:
-
-    sigAxisStatus: dict per axis:
-        {
-          'x': {'IOUT': float, 'IMAG': float, 'SWEEP': str, 'heater': bool, 'timestamp': float},
-          'y': {...},
-          'z': {...}
-        }
-
-    sigQuench: dict e.g. {'x': True, 'y': True} if those axes show quench text in SWEEP?
-
-    sigCommunicationError: str with diagnostic message
-
-    Configuration keys (see .cfg):
-      dual_com, dual_baud, single_com, single_baud
-      line_termination
-      poll_interval_s, fast_poll_interval_s
-      calibration_matrix_diagonal_T_per_A
-      max_currents_A
-      vector_field_limit_T, max_field_T
-      ramp_rates_A_per_s
-      current_tolerance_A
-      heater_warmup_s, heater_cooldown_s
-      default_persistent_mode
-      persistent_idle_behavior
-      enable_software_ramp_fallback
-      use_native_sweep
-      log_directory
-    """
+    # Config options
     _dual_com: str = ConfigOption('dual_com', missing='error')
-    _dual_baud: int = ConfigOption('dual_baud', default=115115, missing='warn')
+    _dual_baud: int = ConfigOption('dual_baud', default=9600, missing='warn')
     _single_com: str = ConfigOption('single_com', missing='error')
-    _single_baud: int = ConfigOption('single_baud', default=115115, missing='warn')
+    _single_baud: int = ConfigOption('single_baud', default=9600, missing='warn')
     _line_termination: str = ConfigOption('line_termination', default='\r', missing='nothing')
 
     _poll_interval_s: float = ConfigOption('poll_interval_s', default=1.0, missing='nothing')
@@ -115,7 +82,9 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
     _use_native_sweep: bool = ConfigOption('use_native_sweep', default=True, missing='nothing')
 
     _log_directory: str = ConfigOption('log_directory', default='', missing='nothing')
+    _debug_io_config: bool = ConfigOption('debug_io', default=False, missing='nothing')
 
+    # Signals
     sigAxisStatus = QtCore.Signal(dict)
     sigQuench = QtCore.Signal(dict)
     sigCommunicationError = QtCore.Signal(str)
@@ -125,23 +94,34 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
         self._mutex = Mutex()
         self._dual_port: Optional[_SerialPortWrapper] = None
         self._single_port: Optional[_SerialPortWrapper] = None
-
         self._stop_poll = False
         self._poll_thread: Optional[threading.Thread] = None
-
-        self._axis_chan = {'x': 1, 'y': 2}  # CHAN mapping for dual supply
+        self._axis_chan = {'x': 1, 'y': 2}
         self._cached_status: Dict[str, Dict[str, Any]] = {'x': {}, 'y': {}, 'z': {}}
-
-        # Quench detection heuristics
         self._quench_pattern = re.compile(r'QUENCH', re.IGNORECASE)
 
-    # ---------------- Lifecycle ----------------
+        # Debug flag (set False to reduce noise after commissioning)
+        self._debug_io = False
+        self._adaptive_fast = True  # new flag for adaptive polling
+        self._ramp_query_backoff_s = 0.03  # backoff per retry
+
+    # ---------- Lifecycle ----------
     def on_activate(self):
+        print("VectorMagnetHardware: opening ports", self._dual_com, self._single_com)
+        self._sanitize_line_termination()
         self._open_ports()
+        self._debug_io = self._debug_io_config
+        # One-time flush
+        try:
+            self._dual_port.reset_input_buffer()
+            self._single_port.reset_input_buffer()
+        except Exception:
+            pass
         self._enter_remote_mode()
         self._stop_poll = False
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
+        print("VectorMagnetHardware: poll thread started")
 
     def on_deactivate(self):
         self._stop_poll = True
@@ -149,7 +129,7 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
             self._poll_thread.join(timeout=2.0)
         self._close_ports()
 
-    # ---------------- Serial Port Handling ----------------
+    # ---------- Serial Port Handling ----------
     def _open_ports(self):
         try:
             self._dual_port = _SerialPortWrapper(self._dual_com, self._dual_baud, timeout=1.0)
@@ -168,41 +148,111 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
             self._single_port.close()
             self._single_port = None
 
-    # ---------------- Low-level IO ----------------
+    # ---------- Line termination sanitization ----------
+    def _sanitize_line_termination(self):
+        # Handle accidental literal '\r' from single-quoted YAML
+        mapping = {
+            '\\r': '\r',
+            '\\n': '\n',
+            '\\r\\n': '\r\n'
+        }
+        if self._line_termination in mapping:
+            print(f"Sanitized line termination {repr(self._line_termination)} -> {repr(mapping[self._line_termination])}")
+            self._line_termination = mapping[self._line_termination]
+
+    # ---------- Low-level IO ----------
     def _write(self, port: _SerialPortWrapper, cmd: str):
-        # Multi-subcommand chaining possible but we keep one per write for clarity
-        line = cmd.strip() + self._line_termination
-        port.write_line(line)
+        data = (cmd.strip() + self._line_termination).encode('ascii')
+        port.write_bytes(data)
+        if self._debug_io:
+            print(f"TX {cmd}:"," ".join(f"{b:02X}" for b in data))
 
-    def _query(self, port: _SerialPortWrapper, cmd: str, timeout: float = 1.0) -> str:
-        with self._mutex:
+    def _collect_bytes(self, port: _SerialPortWrapper, window_s: float, silence_s: float = 0.05) -> bytes:
+        end = time.time() + window_s
+        buf = bytearray()
+        got = False
+        last = time.time()
+        while time.time() < end:
+            w = port.in_waiting()
+            if w:
+                chunk = port.read(w)
+                buf.extend(chunk)
+                got = True
+                last = time.time()
+            else:
+                if got and (time.time() - last) >= silence_s:
+                    break
+                time.sleep(0.002)
+        return bytes(buf)
+
+    def _split_segments(self, raw: bytes) -> list[str]:
+        if not raw:
+            return []
+        txt = raw.decode('ascii', errors='ignore')
+        return [s.strip() for s in re.split(r'[\r\n]+', txt) if s.strip()]
+
+    def _is_echo(self, seg: str, cmd_up: str) -> bool:
+        up = seg.upper()
+        if up == cmd_up:
+            return True
+        if up.startswith('CHAN '):
+            return True
+        if up in ('REMOTE', 'QRESET', 'PSHTR', 'ULIM', 'LLIM'):
+            return True
+        return False
+
+    def _query(self, port: _SerialPortWrapper, cmd: str, attempts: int = 3) -> str:
+        """
+                Test-script style:
+                  - send cmd
+                  - wait fixed ~0.15 s
+                  - read burst
+                  - parse segments; skip echoes; accept first numeric/status
+                  - retry once if only echoes
+                """
+        cmd_up = cmd.strip().upper()
+        first_non_echo = None
+        for attempt in range(1, attempts + 1):
             self._write(port, cmd)
-            t0 = time.time()
-            while True:
-                resp = port.readline()
-                if resp:
-                    return resp.strip()
-                if time.time() - t0 > timeout:
-                    raise TimeoutError(f"Timeout waiting response for {cmd}")
-                time.sleep(0.01)
+            # Wait: slightly longer on attempt 1, then shorter plus a backoff if previous had only echo
+            time.sleep(0.15 if attempt == 1 else 0.10 + (attempt - 2) * self._ramp_query_backoff_s)
+            raw = self._collect_bytes(port, window_s=0.35 if attempt == 1 else 0.25)
+            segs = self._split_segments(raw)
+            if self._debug_io:
+                print(f"RX {cmd} attempt {attempt}: {segs}")
+            saw_non_echo_this_attempt = False
+            for seg in segs:
+                if self._is_echo(seg, cmd_up):
+                    continue
+                if first_non_echo is None:
+                    first_non_echo = seg
+                saw_non_echo_this_attempt = True
+                up = seg.upper()
+                if any(c.isdigit() for c in seg) or up in (
+                'STANDBY', 'RAMPING', 'HOLD', 'SWEEPING UP', 'SWEEPING DOWN'):
+                    if self._debug_io:
+                        print(f"SER >> {cmd} << {repr(seg)}")
+                    return seg
+            # If we saw a non-echo but it wasn't numeric/status, try next attempt (maybe next response chunk)
+            # If we saw nothing but echoes, we also retry (unless last attempt).
+        if first_non_echo:
+            if self._debug_io:
+                print(f"SER >> {cmd} (fallback) << {repr(first_non_echo)}")
+            return first_non_echo
+        raise TimeoutError(f"No non-echo response for {cmd}")
 
-    # ---------------- Public Hardware Control API (used by logic) ----------------
+    # ---------- Public API ----------
     def set_axis_ramp_rate(self, axis: str, rate_A_per_s: float):
-        """Update internal ramp rates (applies to future sweeps)."""
         self._ramp_rates[axis] = float(rate_A_per_s)
-        # If using native multi-range, you could map to RATE 0 ... For now: not applied directly here.
 
     def start_axis_sweep(self, axis: str, target_A: float, fast: bool = False):
-        if not self._use_native_sweep:
-            # Software fallback: mark a simple target and let logic handle stepping
-            return  # logic will handle if fallback selected
-        if axis not in ('x', 'y', 'z'):
+        if not self._use_native_sweep or axis not in ('x', 'y', 'z'):
             return
-        # Acquire current to decide sweep direction
-        current = self.get_axis_current(axis, fresh=True)
+        current = self.get_axis_current(axis, fresh=False)
+        if math.isnan(current):
+            current = 0.0
         if abs(target_A - current) <= self._current_tolerance_A:
             return
-
         direction_up = target_A > current
         if axis in ('x', 'y'):
             port = self._dual_port
@@ -210,15 +260,17 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
         else:
             port = self._single_port
             chan = None
-
         with self._mutex:
-            if axis in ('x', 'y'):
+            if chan is not None:
                 self._write(port, f'CHAN {chan}')
-            # Set appropriate limit
+                time.sleep(0.10)
+                self._collect_bytes(port, 0.20, 0.04)  # drain echo
             if direction_up:
+                self._write(port, f'LLIM {min(current, target_A):.6f}')
                 self._write(port, f'ULIM {target_A:.6f}')
                 cmd = 'SWEEP UP'
             else:
+                self._write(port, f'ULIM {max(current, target_A):.6f}')
                 self._write(port, f'LLIM {target_A:.6f}')
                 cmd = 'SWEEP DOWN'
             if fast:
@@ -226,21 +278,19 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
             self._write(port, cmd)
 
     def sweep_zero(self, fast: bool = False):
-        """Issue SWEEP ZERO to all axes (X,Y on dual, Z on single)."""
         with self._mutex:
-            # Dual
+            # X
             self._write(self._dual_port, f'CHAN {self._axis_chan["x"]}')
+            time.sleep(0.05)
             self._write(self._dual_port, 'SWEEP ZERO' + (' FAST' if fast else ''))
+            # Y
             self._write(self._dual_port, f'CHAN {self._axis_chan["y"]}')
+            time.sleep(0.05)
             self._write(self._dual_port, 'SWEEP ZERO' + (' FAST' if fast else ''))
-            # Single
+            # Z
             self._write(self._single_port, 'SWEEP ZERO' + (' FAST' if fast else ''))
 
     def set_heater(self, group: str, on: bool):
-        """
-        group: 'xy' or 'z'
-        We do not toggle for fast automatically (per requirement).
-        """
         port = self._dual_port if group == 'xy' else self._single_port
         with self._mutex:
             self._write(port, f'PSHTR {"ON" if on else "OFF"}')
@@ -252,79 +302,97 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
 
     def reset_quench(self):
         with self._mutex:
-            # Safe attempt both supplies
             self._write(self._dual_port, 'QRESET')
             self._write(self._single_port, 'QRESET')
 
     def get_axis_current(self, axis: str, fresh: bool = False) -> float:
-        if not fresh and self._cached_status[axis].get('IOUT') is not None:
-            return self._cached_status[axis]['IOUT']
+        if not fresh:
+            v = self._cached_status[axis].get('IOUT')
+            return v if v is not None else float('nan')
         val = self._query_axis_value(axis, 'IOUT?')
         if val is not None:
             self._cached_status[axis]['IOUT'] = val
         return val if val is not None else float('nan')
 
     def get_axis_magnet_current(self, axis: str, fresh: bool = True) -> float:
-        val = self._query_axis_value(axis, 'IMAG?') if fresh else self._cached_status[axis].get('IMAG', float('nan'))
+        if not fresh:
+            v = self._cached_status[axis].get('IMAG')
+            return v if v is not None else float('nan')
+        val = self._query_axis_value(axis, 'IMAG?')
         if val is not None:
             self._cached_status[axis]['IMAG'] = val
         return val if val is not None else float('nan')
 
-    # ---------------- Internal Helpers ----------------
+    # ---------- Internal helpers ----------
     def _enter_remote_mode(self):
         with self._mutex:
-            try:
-                self._write(self._dual_port, 'REMOTE')
-            except Exception:
-                pass
-            try:
-                self._write(self._single_port, 'REMOTE')
-            except Exception:
-                pass
+            for port, tag in ((self._dual_port, 'dual'), (self._single_port, 'single')):
+                try:
+                    self._write(port, 'REMOTE')
+                    time.sleep(0.08)
+                    self._collect_bytes(port, 0.25, 0.05)  # discard echo
+                except Exception as e:
+                    self.sigCommunicationError.emit(f'REMOTE fail {tag}: {e}')
 
     def _query_axis_value(self, axis: str, cmd: str) -> Optional[float]:
         port = self._dual_port if axis in ('x', 'y') else self._single_port
-        if axis in ('x', 'y'):
-            chan = self._axis_chan[axis]
-            with self._mutex:
-                self._write(port, f'CHAN {chan}')
-                resp = self._query(port, cmd)
-        else:
-            with self._mutex:
-                resp = self._query(port, cmd)
         try:
-            # Responses like "87.935 A" or "87.9350 A"
-            token = resp.split()[0]
-            return float(token)
+            with self._mutex:
+                if axis in ('x', 'y'):
+                    chan = self._axis_chan[axis]
+                    self._write(port, f'CHAN {chan}')
+                    time.sleep(0.10)
+                    self._collect_bytes(port, 0.20, 0.04)  # drain echo only
+                resp = self._query(port, cmd)
+            return self._parse_value(resp)
         except Exception:
             return None
 
-    # ---------------- Poll Loop ----------------
+    # ---------- Polling ----------
     def _poll_loop(self):
-        base_interval = self._poll_interval_s
+        base = self._poll_interval_s
+        fast = self._fast_poll_interval_s
         while not self._stop_poll:
             t0 = time.time()
             try:
                 status = self._poll_status_once()
+                # decide interval adaptively
+                any_sweeping = any('Sweeping' in (st.get('SWEEP', '')) for st in status.values())
+                current_interval = fast if (any_sweeping and self._adaptive_fast) else base
                 self.sigAxisStatus.emit(status)
                 self._detect_quench(status)
             except Exception as exc:
+                current_interval = base
+                print("VectorMagnetHardware poll exception:", exc)
                 self.sigCommunicationError.emit(f'Polling error: {exc}')
             elapsed = time.time() - t0
-            sleep_for = max(0.05, base_interval - elapsed)
-            time.sleep(sleep_for)
+            time.sleep(max(0.02, current_interval - elapsed))
+
+    # Add a safe single-command retry wrapper for polling only (to reduce full-cycle failures)
+    def _safe_query(self, port, cmd: str) -> Optional[str]:
+        try:
+            return self._query(port, cmd)
+        except TimeoutError:
+            # One short extra attempt after small backoff
+            time.sleep(0.05)
+            try:
+                return self._query(port, cmd)
+            except Exception:
+                return None
 
     def _poll_status_once(self) -> Dict[str, Dict[str, Any]]:
         now = time.time()
         status: Dict[str, Dict[str, Any]] = {}
-        # Dual axes
         with self._mutex:
+            # Dual channels
             for axis, chan in self._axis_chan.items():
                 self._write(self._dual_port, f'CHAN {chan}')
-                iout = self._query(self._dual_port, 'IOUT?')
-                imag = self._query(self._dual_port, 'IMAG?')
-                sweep = self._query(self._dual_port, 'SWEEP?')
-                htr = self._query(self._dual_port, 'PSHTR?')
+                time.sleep(0.10)
+                self._collect_bytes(self._dual_port, 0.20, 0.04)
+                iout = self._safe_query(self._dual_port, 'IOUT?') or 'IOUT?'
+                imag = self._safe_query(self._dual_port, 'IMAG?') or 'IMAG?'
+                sweep = self._safe_query(self._dual_port, 'SWEEP?') or 'SWEEP?'
+                htr = self._safe_query(self._dual_port, 'PSHTR?') or '0'
                 status[axis] = {
                     'IOUT': self._parse_value(iout),
                     'IMAG': self._parse_value(imag),
@@ -334,10 +402,10 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
                 }
         # Single Z
         with self._mutex:
-            ioutz = self._query(self._single_port, 'IOUT?')
-            imagz = self._query(self._single_port, 'IMAG?')
-            sweepz = self._query(self._single_port, 'SWEEP?')
-            htrz = self._query(self._single_port, 'PSHTR?')
+            ioutz = self._safe_query(self._single_port, 'IOUT?') or 'IOUT?'
+            imagz = self._safe_query(self._single_port, 'IMAG?') or 'IMAG?'
+            sweepz = self._safe_query(self._single_port, 'SWEEP?') or 'SWEEP?'
+            htrz = self._safe_query(self._single_port, 'PSHTR?') or '0'
         status['z'] = {
             'IOUT': self._parse_value(ioutz),
             'IMAG': self._parse_value(imagz),
@@ -348,10 +416,19 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
         self._cached_status.update(status)
         return status
 
+    # ---------- Parsing & Quench ----------
     def _parse_value(self, resp: str) -> float:
+        if not resp:
+            return float('nan')
+        s = resp.strip()
+        for p in ('IOUT=', 'IMAG='):
+            if s.upper().startswith(p):
+                s = s[len(p):].strip()
+        if s.endswith('A'):
+            s = s[:-1].strip()
         try:
-            return float(resp.split()[0])
-        except Exception:
+            return float(s)
+        except ValueError:
             return float('nan')
 
     def _detect_quench(self, status: Dict[str, Dict[str, Any]]):
