@@ -96,8 +96,11 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         scanner.set_scan_motion_mode('per_pixel_closed_loop')  # mode of scanning: 'linewise_open_fast' or 'per_pixel_closed_loop'
         scanner.set_calibration_window_nm(300)              # int value in nm; target range for calibration move
         scanner.set_scan_closed_loop_timeout_s(5)           # how long the scanner has time to move to target range in scans
+        scanner.set_preferred_fast_axis('y')                # What os the fast axes
+        scammer.set_ni_sample_rate_hz(500)                  # How many pixels per sample
 
         scanner.set_follow_gui_cursor_moves(False)          # Disable cursor movements (still allows scans) Default True
+
     """
 
     _threaded = True
@@ -133,6 +136,8 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
     _scan_motion_mode: str = ConfigOption('scan_motion_mode', default='per_pixel_closed_loop', missing='warn')
     # Calibration window for measuring step size (nm)
     _calibration_window_nm: int = ConfigOption('calibration_window_nm', default=300, missing='nothing')
+    _suppress_gui_moves_after_activate_ms: int = ConfigOption('suppress_gui_moves_after_activate_ms', default=2000,
+                                                              missing='nothing')
 
     # Internal state
     sigPositionChanged = QtCore.Signal(dict)
@@ -165,6 +170,8 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         # Thread for scanner and target before scan
         self._worker_thread: Optional[threading.Thread] = None
         self._stored_target_pos: Dict[str, float] = {}
+        self._suppress_until_monotonic: float = 0.0
+        self._preferred_fast_axis: Optional[str] = None
 
     # Lifecycle
     def on_activate(self):
@@ -207,10 +214,12 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         # Emit current position once so the cursor/target snap to the actual position on activation (no motion)
         try:
             curr = self._motion().get_position()
-            self.sigPositionChanged.emit(curr)
-            self._ui_target = dict(curr)
+            self._ui_target = dict(curr)  # CHANGED
+            self.sigPositionChanged.emit(dict(curr))
         except Exception:
             pass
+
+        self._suppress_until_monotonic = time.monotonic() + (float(self._suppress_gui_moves_after_activate_ms) / 1000.0)
 
         #Defered Movement
         self._move_debounce_timer = QtCore.QTimer(self)
@@ -282,6 +291,7 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
         # Validate and clip settings against constraints
         settings = self.constraints.clip(settings)
         self.constraints.check_settings(settings)
+
 
         with self._thread_lock_data:
             self._scan_data = ScanData.from_constraints(settings, self._constraints)
@@ -358,6 +368,26 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                 and not self._scan_intent
                 and not is_module_thread
         ):
+            # Suppression window active right after activation?
+            try:
+                if time.monotonic() < self._suppress_until_monotonic:
+                    # Read the real device position (fallback to target if read fails)
+                    try:
+                        curr = self._motion().get_position()
+                    except Exception:
+                        curr = self._motion().get_target()
+                    # Update our UI shadow and broadcast to GUI
+                    self._ui_target = dict(curr)
+                    try:
+                        self.sigPositionChanged.emit(dict(self._ui_target))
+                    except Exception:
+                        pass
+                    # Important: return the actual position (not the requested target)
+                    return dict(self._ui_target)
+            except Exception:
+                # If anything goes wrong in the guard, fall through to normal handling
+                pass
+
             # If following GUI cursor is enabled, keep existing deferred behavior
             if self._defer_cursor_moves and self._follow_gui_cursor_moves:
                 try:
@@ -548,9 +578,14 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
             if self._scan_motion_mode == 'linewise_open_fast':
                 settings = self._scan_data.settings
                 axes_names = list(settings.axes)
-                fast_ax = axes_names[0]
-                # Build start and end positions (min/max along fast axis; slow axis at its start)
-                fast_min, fast_max = settings.range[0]
+                # Choose fast axis index: user override if valid, else 0
+                fast_idx = 0
+                if len(axes_names) >= 1 and isinstance(self._preferred_fast_axis,
+                                                       str) and self._preferred_fast_axis in axes_names:
+                    fast_idx = axes_names.index(self._preferred_fast_axis)
+                fast_ax = axes_names[fast_idx]
+                # Use the matching range entry
+                fast_min, fast_max = settings.range[fast_idx]
                 pos_start = {}
                 for i, ax in enumerate(axes_names):
                     rng = settings.range[i]
@@ -765,6 +800,22 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                 n = int(settings.resolution[i])
                 axis_values.append(np.linspace(float(mn), float(mx), n))
 
+            # Decide fast axis index for motion
+            fast_idx = 0
+            if len(axes_names) == 2 and isinstance(self._preferred_fast_axis,
+                                                   str) and self._preferred_fast_axis in axes_names:
+                fast_idx = axes_names.index(self._preferred_fast_axis)
+            fast_ax = axes_names[fast_idx]
+            fast_vals = axis_values[fast_idx]
+            nx_fast = int(settings.resolution[fast_idx])
+
+            is_2d = (len(axes_names) == 2)
+            if is_2d:
+                slow_idx = 1 - fast_idx
+                slow_ax = axes_names[slow_idx]
+                slow_vals = axis_values[slow_idx]
+                ny_slow = int(settings.resolution[slow_idx])
+
             # Dynamic closed-loop window (nm) from pixel pitch (use max across axes)
             pixel_sizes_m: List[float] = []
             for i, ax in enumerate(axes_names):
@@ -903,14 +954,6 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
 
             # Motion and scan geometry shortcuts
             motion = self._motion()
-            fast_ax = axes_names[0]  # x = fast
-            nx = int(settings.resolution[0])
-            fast_vals = axis_values[0]
-            is_2d = (len(axes_names) == 2)
-            if is_2d:
-                slow_ax = axes_names[1]  # y = slow
-                ny = int(settings.resolution[1])
-                slow_vals = axis_values[1]
 
             # Branch on scan motion mode
             if self._scan_motion_mode == 'linewise_open_fast':
@@ -920,16 +963,14 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                     raise RuntimeError('ScanData.data not initialized. Did you call data.new_scan()?')
 
                 if not is_2d:
-                    # 1D: assume we are already at first pixel (calibration positioned us there).
-                    for p in range(nx):
+                    # 1D: assume we are already at first pixel.
+                    for p in range(nx_fast):
                         if self._stop_requested:
                             break
-                        # Open-loop absolute move for p>0
                         if p > 0:
                             motion.move_absolute({fast_ax: float(fast_vals[p])}, blocking=True)
                             time.sleep(self._settle_time_s)
 
-                        # Acquire and write
                         ch_means = _acquire_and_aggregate()
                         counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
                         idx_tuple = (p,)
@@ -940,7 +981,7 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
 
                 else:
                     # 2D: for each line, closed-loop to line start; then open-loop pixels on fast axis
-                    for l in range(ny):
+                    for l in range(ny_slow):
                         if self._stop_requested:
                             break
                         pos_line_start = {fast_ax: float(fast_vals[0]), slow_ax: float(slow_vals[l])}
@@ -956,29 +997,29 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                             motion.move_absolute(pos_line_start, blocking=True)
                         time.sleep(self._settle_time_s)
 
-                        for p in range(nx):
+                        for p in range(nx_fast):
                             if self._stop_requested:
                                 break
                             if p > 0:
                                 motion.move_absolute({fast_ax: float(fast_vals[p])}, blocking=True)
                                 time.sleep(self._settle_time_s)
-                            # Acquire and write
                             ch_means = _acquire_and_aggregate()
                             counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
-                            idx_tuple = (p, l)  # x-fast, y-slow
+                            # Write in ORIGINAL axes order expected by GUI
+                            idx_tuple = (p, l) if fast_idx == 0 else (l, p)
                             for ch_name, val in zip(self._present_channels, counts):
                                 arr = data_dict.get(ch_name)
                                 if arr is not None:
                                     arr[idx_tuple] = val
 
             else:
-                # 'per_pixel_closed_loop' (now also x-fast, y-slow when 2D)
+                # 'per_pixel_closed_loop' (x-fast, y-slow in data indexing when fast_idx==0)
                 data_dict = data.data
                 if data_dict is None:
                     raise RuntimeError('ScanData.data not initialized. Did you call data.new_scan()?')
 
                 if not is_2d:
-                    for p in range(nx):
+                    for p in range(nx_fast):
                         if self._stop_requested:
                             break
                         pos = {fast_ax: float(fast_vals[p])}
@@ -1006,8 +1047,8 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                                 arr[idx_tuple] = val
 
                 else:
-                    for l in range(ny):  # slow axis outer
-                        for p in range(nx):  # fast axis inner
+                    for l in range(ny_slow):  # slow axis outer
+                        for p in range(nx_fast):  # fast axis inner
                             if self._stop_requested:
                                 break
                             pos = {fast_ax: float(fast_vals[p]), slow_ax: float(slow_vals[l])}
@@ -1028,7 +1069,8 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
 
                             ch_means = _acquire_and_aggregate()
                             counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
-                            idx_tuple = (p, l)  # x-fast, y-slow
+                            # Write in ORIGINAL axes order expected by GUI
+                            idx_tuple = (p, l) if fast_idx == 0 else (l, p)
                             for ch_name, val in zip(self._present_channels, counts):
                                 arr = data_dict.get(ch_name)
                                 if arr is not None:
@@ -1198,3 +1240,83 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
     def get_follow_gui_cursor_moves(self) -> bool:
         """Return whether hardware follows non-blocking GUI cursor moves."""
         return bool(self._follow_gui_cursor_moves)
+
+    # Add inside class AMC300NIScanningProbeInterfuse, e.g. near other public API methods.
+
+    def set_ni_sample_rate_hz(self, rate_hz: float) -> None:
+        """
+        Set desired NI sample rate (Hz).
+        - If no scan is running, it also tries to apply the rate to the NI streamer immediately.
+        - If a scan is running, the value is stored and will be applied on the next configure/start.
+        """
+        try:
+            val = float(rate_hz)
+        except Exception as exc:
+            raise ValueError("rate_hz must be a number (Hz).") from exc
+        if val <= 0:
+            raise ValueError("rate_hz must be > 0 Hz.")
+
+        # Store new rate
+        self._ni_sample_rate_hz = val
+
+        # Apply immediately only when not scanning; otherwise defer
+        if self.is_scan_running:
+            try:
+                self.log.info(f"NI sample rate set to {val} Hz (deferred until next scan).")
+            except Exception:
+                pass
+            return
+
+        # Best-effort apply to NI backend now
+        try:
+            self._ni_in().set_sample_rate(val)
+            try:
+                self.log.info(f"NI sample rate set to {val} Hz (applied to NI streamer).")
+            except Exception:
+                pass
+        except Exception:
+            # Some backends only accept rate during configuration/start
+            try:
+                self.log.info(f"NI sample rate set to {val} Hz (will apply on next configure/start).")
+            except Exception:
+                pass
+
+    def get_ni_sample_rate_hz(self) -> float:
+        """
+        Return the currently configured NI sample rate (Hz) stored in this interfuse.
+        Note: The NI backend might still be using an older rate until the next configure/start.
+        """
+        return float(self._ni_sample_rate_hz)
+
+    def set_preferred_fast_axis(self, axis: Optional[str]) -> None:
+        """
+        Set the preferred fast axis name for 2D scans.
+        - axis: e.g. 'x' or 'y'. Use None to clear and use default (first axis).
+        - Takes effect on the next scan start.
+        """
+        if axis is None:
+            self._preferred_fast_axis = None
+            try:
+                self.log.info('preferred_fast_axis cleared (default fast axis will be used).')
+            except Exception:
+                pass
+            return
+        axis = str(axis).strip()
+        # Validate against available axes
+        avail = tuple(self._constraints.axes.keys()) if self._constraints else tuple()
+        if not avail:
+            try:
+                avail = tuple(self._motion().constraints.axes.keys())
+            except Exception:
+                avail = tuple()
+        if axis not in avail:
+            raise ValueError(f"Unknown axis '{axis}'. Available axes: {avail}")
+        self._preferred_fast_axis = axis
+        try:
+            self.log.info(f'preferred_fast_axis set to {self._preferred_fast_axis} (applies on next scan).')
+        except Exception:
+            pass
+
+    def get_preferred_fast_axis(self) -> Optional[str]:
+        """Return the preferred fast axis or None if default is used."""
+        return self._preferred_fast_axis
