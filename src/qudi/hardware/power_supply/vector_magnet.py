@@ -143,6 +143,8 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
     _use_native_sweep: bool = ConfigOption('use_native_sweep', default=True, missing='nothing')
 
     _log_directory: str = ConfigOption('log_directory', default='', missing='nothing')
+    _enter_remote_on_activate: bool = ConfigOption('enter_remote_on_activate', default=True, missing='nothing')
+    _restore_local_on_deactivate: bool = ConfigOption('restore_local_on_deactivate', default=True, missing='nothing')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -180,7 +182,8 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
             self._single_port.reset_input_buffer()
         except Exception:
             pass
-        self._enter_remote_mode()
+        if self._enter_remote_on_activate:
+            self.go_remote()
         self._stop_poll = False
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
@@ -189,6 +192,12 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
         self._stop_poll = True
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=2.0)
+        if self._restore_local_on_deactivate:
+            try:
+                self.go_local()
+            except Exception:
+                # Non-fatal: still close ports
+                pass
         self._close_ports()
 
     # ---------------- Serial Port Handling ----------------
@@ -249,7 +258,7 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
             return True
         if up.startswith('CHAN '):
             return True
-        if up in ('REMOTE', 'QRESET', 'PSHTR', 'ULIM', 'LLIM'):
+        if up in ('REMOTE', 'LOCAL', 'QRESET', 'PSHTR', 'ULIM', 'LLIM'):
             return True
         return False
 
@@ -336,8 +345,7 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
 
     def set_axis_heater(self, axis: str, on: bool):
         """
-        Set a per-axis heater (x/y share a physical supply but are addressed by CHAN selection).
-        Silent on errors (instrument may not have active heater).
+        Set per-axis heater (persistent switch). Best-effort confirmation using PSHTR?.
         """
         try:
             with self._mutex:
@@ -347,10 +355,22 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
                     time.sleep(0.05)
                     self._collect_bytes(self._dual_port, 0.15, 0.04)
                     self._write(self._dual_port, f'PSHTR {"ON" if on else "OFF"}')
+                    # Confirm a few times
+                    for _ in range(10):
+                        time.sleep(0.1)
+                        resp = self._safe_query(self._dual_port, 'PSHTR?') or ''
+                        if bool(resp.startswith('1')) == bool(on):
+                            break
                 elif axis == 'z':
                     self._write(self._single_port, f'PSHTR {"ON" if on else "OFF"}')
+                    for _ in range(10):
+                        time.sleep(0.1)
+                        resp = self._safe_query(self._single_port, 'PSHTR?') or ''
+                        if bool(resp.startswith('1')) == bool(on):
+                            break
         except Exception:
-            pass  # ignore
+            # Ignore; logic will still wait heater_warmup_s before sweeping
+            pass
 
     def query_axis_heater(self, axis: str) -> bool:
         """Query per-axis heater state (using CHAN for x/y). Returns False on error."""
@@ -537,3 +557,32 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
 
     def ramp_rates_A_per_s(self) -> Dict[str, float]:
         return dict(self._ramp_rates)
+
+    def go_remote(self):
+        """Put both supplies into REMOTE (front panel locked)."""
+        with self._mutex:
+            for port, tag in ((self._dual_port, 'dual'), (self._single_port, 'single')):
+                try:
+                    self._write(port, 'REMOTE')
+                    time.sleep(0.08)
+                    self._collect_bytes(port, 0.25, 0.05)
+                except Exception as e:
+                    self.sigCommunicationError.emit(f'REMOTE fail {tag}: {e}')
+
+    def go_local(self):
+        """Return both supplies to LOCAL (front panel enabled)."""
+        with self._mutex:
+            for port, tag in ((self._dual_port, 'dual'), (self._single_port, 'single')):
+                ok = False
+                # Try the variants some firmware accept
+                for cmd in ('LOCAL', 'REMOTE 0', 'REMOTE OFF'):
+                    try:
+                        self._write(port, cmd)
+                        time.sleep(0.08)
+                        self._collect_bytes(port, 0.25, 0.05)
+                        ok = True
+                        break
+                    except Exception:
+                        continue
+                if not ok:
+                    self.sigCommunicationError.emit(f'LOCAL fail {tag}: could not release remote')

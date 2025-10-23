@@ -84,6 +84,12 @@ class VectorMagnetLogic(Base):
     _log_to_file: bool = ConfigOption('log_to_file', default=True, missing='nothing')
     _log_file_basename: str = ConfigOption('log_file_basename', default='vector_magnet_log.txt', missing='nothing')
     _ramp_progress_update_ms: int = ConfigOption('ramp_progress_update_ms', default=300, missing='nothing')
+    _field_use_imag_when_heater_off: bool = ConfigOption(
+        'field_use_imag_when_heater_off', default=False, missing='nothing'
+    )
+    _field_zero_epsilon_A: float = ConfigOption(
+        'field_zero_epsilon_A', default=1e-4, missing='nothing'
+    )
 
     # Signals
     sigFieldReadback = QtCore.Signal(dict)
@@ -107,6 +113,7 @@ class VectorMagnetLogic(Base):
         self._vector_limit_T: float = 0.5
         self._component_limit_T: float = 0.5
         self._current_tolerance_A: float = 0.01
+        self._heater_warmup_s: float = 5.0  # default if not supplied by hardware
 
         # Persistent mode
         self._persistent_enabled: bool = False
@@ -137,6 +144,10 @@ class VectorMagnetLogic(Base):
         self._vector_limit_T = hw._vector_field_limit_T
         self._component_limit_T = hw._max_field_T
         self._current_tolerance_A = hw._current_tolerance_A
+        try:
+            self._heater_warmup_s = float(hw._heater_warmup_s)
+        except Exception:
+            self._heater_warmup_s = 5.0
         self._persistent_enabled = hw._default_persistent
         self._persistent_idle_behavior = hw._persistent_idle_behavior
 
@@ -201,20 +212,27 @@ class VectorMagnetLogic(Base):
         self.hardware().set_axis_ramp_rate(axis, rate_A_per_s)
         self._log(f'RAMP_RATE_SET axis={axis} rate={rate_A_per_s}')
 
+    # ... inside class VectorMagnetLogic ...
+
     def zero_all(self, fast: bool = False):
-        """Sweep all axes to zero and treat as a ramp for progress tracking."""
+        """Sweep all axes to zero with proper heater gating."""
         self._log('ZERO_ALL_REQUEST')
-        self.hardware().sweep_zero(fast=fast)
-        for ax in self._target_currents:
-            self._target_currents[ax] = 0.0
-        self._ramping_axes = {'x', 'y', 'z'}
-        self._ramp_start_currents.clear()
-        if self._ramp_progress_timer and not self._ramp_progress_timer.isActive():
-            self._ramp_progress_timer.start()
-        # Ensure heaters ON (some controllers require heater on while sweeping)
+
+        # Turn heaters ON for all axes and warm up, then issue zero sweep
         for ax in ('x', 'y', 'z'):
             self.hardware().set_axis_heater(ax, True)
-        self.sigStatusText.emit("Zero-all sweep started.")
+
+        def _do_zero():
+            self.hardware().sweep_zero(fast=fast)
+            # Treat as ramp for progress
+            self._target_currents.update({'x': 0.0, 'y': 0.0, 'z': 0.0})
+            self._ramping_axes = {'x', 'y', 'z'}
+            self._ramp_start_currents.clear()
+            if self._ramp_progress_timer and not self._ramp_progress_timer.isActive():
+                self._ramp_progress_timer.start()
+            self.sigStatusText.emit("Zero-all sweep started.")
+
+        QtCore.QTimer.singleShot(max(0, int(round(self._heater_warmup_s * 1000.0))), _do_zero)
 
     def request_set_field_cartesian(self, Bx_mT: float, By_mT: float, Bz_mT: float, fast: bool = False):
         self._set_field_internal(Bx_mT / 1000.0, By_mT / 1000.0, Bz_mT / 1000.0, fast=fast)
@@ -289,46 +307,69 @@ class VectorMagnetLogic(Base):
         self.sigStatusText.emit("Ramp started.")
         self._begin_ramps(fast=fast)
 
+    # ... inside class VectorMagnetLogic ...
+
     def _begin_ramps(self, fast: bool):
-        """Issue native sweeps for axes that require movement and start progress tracking."""
+        """
+        Issue native sweeps, but only after ensuring the heaters are ON and warmed up.
+        Prefer magnet current (IMAG) for 'do we need to move?' decisions to avoid
+        false positives from stray IOUT values.
+        """
         hw = self.hardware()
         self._ramping_axes.clear()
         self._ramp_start_currents.clear()
 
-        # Determine which axes need ramping
-        needing = []
+        # Determine axes needing ramping (prefer IMAG; fall back to IOUT only if IMAG is NaN)
+        needing: list[str] = []
         for ax in ('x', 'y', 'z'):
-            curr = hw.get_axis_current(ax, fresh=False)
+            curr = hw.get_axis_magnet_current(ax, fresh=True)
             if math.isnan(curr):
+                curr = hw.get_axis_current(ax, fresh=True)
+            if math.isnan(curr):
+                # Unknown yet; we'll retry shortly if we have no axes
                 continue
             tgt = self._target_currents[ax]
             if abs(tgt - curr) > self._current_tolerance_A:
                 needing.append(ax)
 
-        # Turn heaters ON for axes that will ramp
+        if not needing:
+            # If some cached values are still NaN, retry shortly; otherwise finalize
+            if any(math.isnan(hw.get_axis_magnet_current(a, fresh=True)) and
+                   math.isnan(hw.get_axis_current(a, fresh=True))
+                   for a in ('x', 'y', 'z')):
+                QtCore.QTimer.singleShot(250, lambda: self._begin_ramps(fast=fast))
+                return
+            self._post_ramp_finalize()
+            return
+
+        # 1) Ensure heaters ON for all ramping axes
         for ax in needing:
             hw.set_axis_heater(ax, True)
 
-        # Start native sweeps
-        if hw._use_native_sweep:
-            for ax in needing:
-                curr = hw.get_axis_current(ax, fresh=False)
-                if math.isnan(curr):
-                    continue
-                self._ramping_axes.add(ax)
-                self._ramp_start_currents[ax] = curr
-                hw.start_axis_sweep(ax, self._target_currents[ax], fast=fast)
+        # 2) Warm-up delay before starting sweeps so persistent switches really open
+        delay_ms = max(0, int(round(self._heater_warmup_s * 1000.0)))
+        QtCore.QTimer.singleShot(delay_ms, lambda: self._start_sweeps_after_warmup(needing, fast))
 
-            if not self._ramping_axes:
-                # If data incomplete, retry shortly, else finalize
-                if any(math.isnan(hw.get_axis_current(a, fresh=False)) for a in ('x', 'y', 'z')):
-                    QtCore.QTimer.singleShot(250, lambda: self._begin_ramps(fast=fast))
-                    return
-                self._post_ramp_finalize()
-                return
+    def _start_sweeps_after_warmup(self, axes_to_ramp: list[str], fast: bool):
+        """Called after heater warm-up time; actually start sweeps and begin progress tracking."""
+        hw = self.hardware()
 
-            if self._ramp_progress_timer and not self._ramp_progress_timer.isActive():
-                self._ramp_progress_timer.start()
+        started_any = False
+        for ax in axes_to_ramp:
+            # Prefer magnet current for the final delta check
+            curr = hw.get_axis_magnet_current(ax, fresh=True)
+            if math.isnan(curr):
+                curr = hw.get_axis_current(ax, fresh=True)
+            tgt = self._target_currents[ax]
+            if math.isnan(curr) or abs(tgt - curr) <= self._current_tolerance_A:
+                continue
+            self._ramping_axes.add(ax)
+            self._ramp_start_currents[ax] = curr
+            hw.start_axis_sweep(ax, tgt, fast=fast)
+            started_any = True
+
+        if started_any and self._ramp_progress_timer and not self._ramp_progress_timer.isActive():
+            self._ramp_progress_timer.start()
 
     # ---------------- Ramp Progress ----------------
 
@@ -398,16 +439,56 @@ class VectorMagnetLogic(Base):
 
     # ---------------- Hardware Status Event Handlers ----------------
 
+    def _current_for_field(self, st: dict) -> float:
+        """
+        Choose the current used to compute the field for this axis.
+
+        Default (recommended when IMAG is stale on idle axes):
+        - Prefer IOUT (supply output) always.
+        - Fall back to IMAG only if IOUT is NaN/unavailable.
+        - Clamp very small magnitudes to 0 using _field_zero_epsilon_A.
+
+        Optional (enable via field_use_imag_when_heater_off=True):
+        - If heater is OFF (persistent switch closed), prefer IMAG; else prefer IOUT.
+        """
+        iout = st.get('IOUT')
+        imag = st.get('IMAG')
+        heater_on = bool(st.get('heater', False))
+        eps = float(self._field_zero_epsilon_A)
+
+        def isnum(x):
+            try:
+                return (x is not None) and (not math.isnan(x))
+            except Exception:
+                return False
+
+        # Policy: either IMAG-when-heater-off, or always prefer IOUT
+        if self._field_use_imag_when_heater_off and (not heater_on):
+            # Heater OFF policy: IMAG preferred, else IOUT
+            val = imag if isnum(imag) else (iout if isnum(iout) else 0.0)
+        else:
+            # Default policy: IOUT preferred, else IMAG
+            val = iout if isnum(iout) else (imag if isnum(imag) else 0.0)
+
+        if abs(val) < eps:
+            return 0.0
+        return val
+
     @QtCore.Slot(dict)
     def _on_axis_status(self, status: Dict[str, dict]):
-        """Handle polled axis status: update field and current readbacks, heater states, sweep states."""
+        """Update field and current readbacks, heater states, sweep states."""
         hw = self.hardware()
 
-        # Convert magnet currents to fields via diagonal calibration
-        Bx = status['x']['IMAG'] * hw._cal_diag['x']
-        By = status['y']['IMAG'] * hw._cal_diag['y']
-        Bz = status['z']['IMAG'] * hw._cal_diag['z']
-        Bmag = math.sqrt(Bx ** 2 + By ** 2 + Bz ** 2)
+        # Effective coil currents for field computation (policy above)
+        ix_eff = self._current_for_field(status['x'])
+        iy_eff = self._current_for_field(status['y'])
+        iz_eff = self._current_for_field(status['z'])
+
+        # Field from diagonal calibration
+        Bx = ix_eff * hw._cal_diag['x']
+        By = iy_eff * hw._cal_diag['y']
+        Bz = iz_eff * hw._cal_diag['z']
+        Bmag = math.sqrt(Bx * Bx + By * By + Bz * Bz)
 
         scale = 1000.0 if self._field_units.lower() == 'mt' else 1.0
         self.sigFieldReadback.emit({
@@ -417,6 +498,7 @@ class VectorMagnetLogic(Base):
             'Bmag_mT': Bmag * scale
         })
 
+        # Keep showing supply outputs for current readback (unchanged)
         self.sigCurrentReadback.emit({
             'Ix': status['x']['IOUT'],
             'Iy': status['y']['IOUT'],
