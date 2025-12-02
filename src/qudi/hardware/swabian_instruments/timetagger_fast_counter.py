@@ -1,23 +1,28 @@
 # -*- coding: utf-8 -*-
-
 """
-A hardware module for communicating with the fast counter FPGA.
+TimeTagger fast counter for Qudi pulsed measurements (local USB or network).
 
-Copyright (c) 2021, the qudi developers. See the AUTHORS.md file at the top-level directory of this
-distribution and on <https://github.com/Ulm-IQO/qudi-iqo-modules/>
+- Local:  tt.createTimeTagger()
+- Network: TimeTagger.createTimeTaggerNetwork('host:port')
 
-This file is part of qudi.
+Implements FastCounterInterface for use with pulsed_measurement_logic.
 
-Qudi is free software: you can redistribute it and/or modify it under the terms of
-the GNU Lesser General Public License as published by the Free Software Foundation,
-either version 3 of the License, or (at your option) any later version.
+Config example:
+    fastcounter_timetagger:
+        module.Class: 'swabian_instruments.timetagger_fast_counter.TimeTaggerFastCounter'
+        options:
+            network: True                 # set False for local USB
+            address: '134.60.31.152:5353'
+            timetagger_serial: ''         # optional, for local USB selection
+            timetagger_resolution: 'Standard'  # optional
+            timetagger_channel_apd_0: 0
+            timetagger_channel_apd_1: 1
+            timetagger_channel_detect: 2
+            timetagger_channel_sequence: 3
+            timetagger_sum_channels: true # sum APD0+APD1 (virtual channel)
+            trigger_level_detect_v: 0.25  # optional, volts
+            trigger_level_apd_v: 0.05     # optional, volts
 
-Qudi is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
-without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-See the GNU Lesser General Public License for more details.
-
-You should have received a copy of the GNU Lesser General Public License along with qudi.
-If not, see <https://www.gnu.org/licenses/>.
 """
 
 import numpy as np
@@ -28,210 +33,241 @@ from qudi.core.configoption import ConfigOption
 
 
 class TimeTaggerFastCounter(FastCounterInterface):
-    """ Hardware class to controls a Time Tagger from Swabian Instruments.
+    # Connection options
+    _network: bool = ConfigOption('network', default=False, missing='warn')
+    _address: str = ConfigOption('address', default='', missing='warn')
+    _timetagger_serial: str = ConfigOption('timetagger_serial', default='', missing='warn')
+    _timetagger_resolution: str = ConfigOption('timetagger_resolution', default='Standard', missing='warn')
 
-    Example config for copy-paste:
+    # Channel mapping
+    _channel_apd_0: int = ConfigOption('timetagger_channel_apd_0', missing='error')
+    _channel_apd_1: int = ConfigOption('timetagger_channel_apd_1', missing='error')
+    _channel_detect: int = ConfigOption('timetagger_channel_detect', missing='error')
+    _channel_sequence: int = ConfigOption('timetagger_channel_sequence', missing='error')
 
-    fastcounter_timetagger:
-        module.Class: 'swabian_instruments.timetagger_fast_counter.TimeTaggerFastCounter'
-        options:
-            timetagger_channel_apd_0: 0
-            timetagger_channel_apd_1: 1
-            timetagger_channel_detect: 2
-            timetagger_channel_sequence: 3
-            timetagger_sum_channels: 4
+    # Sum APD channels (virtual combiner)
+    _sum_channels: bool = ConfigOption('timetagger_sum_channels', default=True, missing='warn',
+                                       constructor=lambda v: bool(v))
 
-    """
-
-    _channel_apd_0 = ConfigOption('timetagger_channel_apd_0', missing='error')
-    _channel_apd_1 = ConfigOption('timetagger_channel_apd_1', missing='error')
-    _channel_detect = ConfigOption('timetagger_channel_detect', missing='error')
-    _channel_sequence = ConfigOption('timetagger_channel_sequence', missing='error')
-    _sum_channels = ConfigOption('timetagger_sum_channels', True, missing='warn')
+    # Optional trigger levels (volts)
+    _trig_level_detect_v: float = ConfigOption('trigger_level_detect_v', default=None, missing='nothing')
+    _trig_level_apd_v: float = ConfigOption('trigger_level_apd_v', default=None, missing='nothing')
 
     def on_activate(self):
-        """ Connect and configure the access to the FPGA.
-        """
-        self._tagger = tt.createTimeTagger()
-        self._tagger.reset()
-
-        self._number_of_gates = int(100)
-        self._bin_width = 1
-        self._record_length = int(4000)
-
-        if self._sum_channels:
-            self._channel_combined = tt.Combiner(self._tagger, channels=[self._channel_apd_0, self._channel_apd_1])
-            self._channel_apd = self._channel_combined.getChannel()
+        """Create/attach to the TimeTagger (local or network) and prepare channels."""
+        # Create tagger
+        if self._network:
+            if not self._address:
+                raise ValueError('network=True but no "address" provided (expected "host:port").')
+            self._tagger = tt.createTimeTaggerNetwork(self._address)
         else:
+            # Optional: honor specific serial if present, otherwise default
+            self._tagger = tt.createTimeTagger(self._timetagger_serial) if self._timetagger_serial \
+                else tt.createTimeTagger()
+
+        # Reset to a known state
+        try:
+            self._tagger.reset()
+        except Exception:
+            # Some network wrappers may not expose reset; safe to ignore if unavailable
+            pass
+
+        # Build APD input (optionally summed)
+        if self._sum_channels:
+            comb = tt.Combiner(self._tagger, channels=[self._channel_apd_0, self._channel_apd_1])
+            self._channel_apd = comb.getChannel()
+            self._combiner = comb
+        else:
+            self._combiner = None
             self._channel_apd = self._channel_apd_0
 
-        self.log.info('TimeTagger (fast counter) configured to use  channel {0}'
-                      .format(self._channel_apd))
+        # Optional trigger levels (set only if provided)
+        try:
+            if self._trig_level_detect_v is not None:
+                self._tagger.setTriggerLevel(self._channel_detect, float(self._trig_level_detect_v))
+            if self._trig_level_apd_v is not None:
+                # Apply to both raw APD channels if available; also to the combined virtual channel if supported
+                self._tagger.setTriggerLevel(self._channel_apd_0, float(self._trig_level_apd_v))
+                try:
+                    self._tagger.setTriggerLevel(self._channel_apd_1, float(self._trig_level_apd_v))
+                except Exception:
+                    pass
+                try:
+                    # some backends may not accept setting on virtual channel
+                    self._tagger.setTriggerLevel(self._channel_apd, float(self._trig_level_apd_v))
+                except Exception:
+                    pass
+        except Exception as e:
+            self.log.warning(f'Failed to set trigger levels on TimeTagger: {e}')
 
-        self.statusvar = 0
+        # Defaults
+        self._number_of_gates = 1
+        self._bin_width_s = 1e-9
+        self._record_length_s = 4e-6
+        self._pulsed = None
+        self.statusvar = 0  # 0=unconfigured
 
-    def get_constraints(self):
-        """ Retrieve the hardware constrains from the Fast counting device.
-
-        @return dict: dict with keys being the constraint names as string and
-                      items are the definition for the constaints.
-
-         The keys of the returned dictionary are the str name for the constraints
-        (which are set in this method).
-
-                    NO OTHER KEYS SHOULD BE INVENTED!
-
-        If you are not sure about the meaning, look in other hardware files to
-        get an impression. If still additional constraints are needed, then they
-        have to be added to all files containing this interface.
-
-        The items of the keys are again dictionaries which have the generic
-        dictionary form:
-            {'min': <value>,
-             'max': <value>,
-             'step': <value>,
-             'unit': '<value>'}
-
-        Only the key 'hardware_binwidth_list' differs, since they
-        contain the list of possible binwidths.
-
-        If the constraints cannot be set in the fast counting hardware then
-        write just zero to each key of the generic dicts.
-        Note that there is a difference between float input (0.0) and
-        integer input (0), because some logic modules might rely on that
-        distinction.
-
-        ALL THE PRESENT KEYS OF THE CONSTRAINTS DICT MUST BE ASSIGNED!
-        """
-
-        constraints = dict()
-
-        # the unit of those entries are seconds per bin. In order to get the
-        # current binwidth in seonds use the get_binwidth method.
-        constraints['hardware_binwidth_list'] = [1 / 1000e6]
-
-        # TODO: think maybe about a software_binwidth_list, which will
-        #      postprocess the obtained counts. These bins must be integer
-        #      multiples of the current hardware_binwidth
-
-        return constraints
+        self.log.info(f'TimeTagger fast counter ready (network={self._network}, '
+                      f'address="{self._address}" if network).')
 
     def on_deactivate(self):
-        """ Deactivate the FPGA.
-        """
-        if self.module_state() == 'locked':
-            self.pulsed.stop()
-        self.pulsed.clear()
-        self.pulsed = None
+        """Stop/clear measurement and free the tagger."""
+        try:
+            if self.module_state() == 'locked':
+                self.stop_measure()
+        except Exception:
+            pass
+        # Clear measurement objects
+        try:
+            if self._pulsed is not None:
+                try:
+                    self._pulsed.stop()
+                except Exception:
+                    pass
+                try:
+                    self._pulsed.clear()
+                except Exception:
+                    pass
+                self._pulsed = None
+        except Exception:
+            pass
+        # Free the tagger
+        try:
+            tt.freeTimeTagger(self._tagger)
+        except Exception:
+            pass
+        finally:
+            self._tagger = None
+
+    # ---------- FastCounterInterface implementation ----------
+
+    def get_constraints(self):
+        """Return supported hardware bin widths (seconds per bin)."""
+        # Keep conservative defaults; pulsed logic can rebin in software if needed
+        return {
+            'hardware_binwidth_list': [
+                1.0 / 1000e6,  # 1 ns
+                0.5e-9,        # 0.5 ns
+                0.2e-9,        # 0.2 ns
+                0.1e-9         # 0.1 ns
+            ]
+        }
 
     def configure(self, bin_width_s, record_length_s, number_of_gates=0):
-
-        """ Configuration of the fast counter.
-
-        @param float bin_width_s: Length of a single time bin in the time trace
-                                  histogram in seconds.
-        @param float record_length_s: Total length of the timetrace/each single
-                                      gate in seconds.
-        @param int number_of_gates: optional, number of gates in the pulse
-                                    sequence. Ignore for not gated counter.
-
-        @return tuple(binwidth_s, gate_length_s, number_of_gates):
-                    binwidth_s: float the actual set binwidth in seconds
-                    gate_length_s: the actual set gate length in seconds
-                    number_of_gates: the number of gated, which are accepted
         """
-        self._number_of_gates = number_of_gates
-        self._bin_width = bin_width_s * 1e9
-        self._record_length = 1 + int(record_length_s / bin_width_s)
-        self.statusvar = 1
+        Configure TimeTagger.TimeDifferences for pulsed histograms.
 
-        self.pulsed = tt.TimeDifferences(
+        Parameters:
+            bin_width_s: float (seconds per bin)
+            record_length_s: float (seconds per histogram window)
+            number_of_gates: int (pulsed logic "n_histograms")
+
+        Returns:
+            (bin_width_s, record_length_s, number_of_gates)
+        """
+        # Store settings
+        self._number_of_gates = int(max(1, number_of_gates))
+        self._bin_width_s = float(bin_width_s)
+        self._record_length_s = float(record_length_s)
+
+        # Convert to TimeTagger units:
+        # TimeDifferences wants binwidth in ps and n_bins as integer
+        binwidth_ps = int(np.round(self._bin_width_s * 1e12))
+        n_bins = int(1 + np.floor(self._record_length_s / self._bin_width_s))
+
+        # Create/replace measurement
+        if self._pulsed is not None:
+            try:
+                self._pulsed.stop()
+            except Exception:
+                pass
+            try:
+                self._pulsed.clear()
+            except Exception:
+                pass
+            self._pulsed = None
+
+        self._pulsed = tt.TimeDifferences(
             tagger=self._tagger,
             click_channel=self._channel_apd,
             start_channel=self._channel_detect,
-            next_channel=self._channel_detect,
-            sync_channel=tt.CHANNEL_UNUSED,
-            binwidth=int(np.round(self._bin_width * 1000)),
-            n_bins=int(self._record_length),
-            n_histograms=number_of_gates)
+            next_channel=self._channel_detect,      # standard pulsed timing
+            sync_channel=tt.CHANNEL_UNUSED,         # unused here
+            binwidth=binwidth_ps,
+            n_bins=n_bins,
+            n_histograms=self._number_of_gates
+        )
+        # Ensure measurement is in a known state
+        try:
+            self._pulsed.stop()
+        except Exception:
+            pass
 
-        self.pulsed.stop()
-
-        return bin_width_s, record_length_s, number_of_gates
+        self.statusvar = 1  # idle
+        return self._bin_width_s, self._record_length_s, self._number_of_gates
 
     def start_measure(self):
-        """ Start the fast counter. """
+        """Start pulsed counting."""
         self.module_state.lock()
-        self.pulsed.clear()
-        self.pulsed.start()
-        self.statusvar = 2
+        if self._pulsed is None:
+            raise RuntimeError('TimeTaggerFastCounter not configured.')
+        try:
+            self._pulsed.clear()
+        except Exception:
+            pass
+        self._pulsed.start()
+        self.statusvar = 2  # running
         return 0
 
     def stop_measure(self):
-        """ Stop the fast counter. """
+        """Stop pulsed counting."""
         if self.module_state() == 'locked':
-            self.pulsed.stop()
-            self.module_state.unlock()
-        self.statusvar = 1
+            try:
+                if self._pulsed is not None:
+                    self._pulsed.stop()
+            finally:
+                self.module_state.unlock()
+        self.statusvar = 1  # idle
         return 0
 
     def pause_measure(self):
-        """ Pauses the current measurement.
-
-        Fast counter must be initially in the run state to make it pause.
-        """
+        """Pause pulsed counting."""
         if self.module_state() == 'locked':
-            self.pulsed.stop()
-            self.statusvar = 3
+            try:
+                if self._pulsed is not None:
+                    self._pulsed.stop()
+            finally:
+                self.statusvar = 3  # paused
         return 0
 
     def continue_measure(self):
-        """ Continues the current measurement.
-
-        If fast counter is in pause state, then fast counter will be continued.
-        """
+        """Continue pulsed counting after pause."""
         if self.module_state() == 'locked':
-            self.pulsed.start()
+            if self._pulsed is None:
+                raise RuntimeError('TimeTaggerFastCounter not configured.')
+            self._pulsed.start()
             self.statusvar = 2
         return 0
 
     def is_gated(self):
-        """ Check the gated counting possibility.
-
-        Boolean return value indicates if the fast counter is a gated counter
-        (TRUE) or not (FALSE).
-        """
-        return True
+        """This counter is used in gated/pulsed mode."""
+        return False
 
     def get_data_trace(self):
-        """ Polls the current timetrace data from the fast counter.
-
-        @return numpy.array: 2 dimensional array of dtype = int64. This counter
-                             is gated the the return array has the following
-                             shape:
-                                returnarray[gate_index, timebin_index]
-
-        The binning, specified by calling configure() in forehand, must be taken
-        care of in this hardware class. A possible overflow of the histogram
-        bins must be caught here and taken care of.
         """
-        info_dict = {'elapsed_sweeps': None,
-                     'elapsed_time': None}  # TODO : implement that according to hardware capabilities
-        return np.array(self.pulsed.getData(), dtype='int64'), info_dict
+        Return histogram data for all gates as int64 array and info dict:
+            shape = [n_histograms, n_bins]
+        """
+        info = {'elapsed_sweeps': None, 'elapsed_time': None}
+        if self._pulsed is None:
+            return np.zeros((self._number_of_gates, 1), dtype='int64'), info
+        data = self._pulsed.getData()
+        return np.array(data, dtype='int64'), info
 
     def get_status(self):
-        """ Receives the current status of the Fast Counter and outputs it as
-            return value.
-
-        0 = unconfigured
-        1 = idle
-        2 = running
-        3 = paused
-        -1 = error state
-        """
+        """0=unconfigured, 1=idle, 2=running, 3=paused, -1=error."""
         return self.statusvar
 
     def get_binwidth(self):
-        """ Returns the width of a single timebin in the timetrace in seconds. """
-        width_in_seconds = self._bin_width * 1e-9
-        return width_in_seconds
+        """Return current bin width (seconds)."""
+        return float(self._bin_width_s)

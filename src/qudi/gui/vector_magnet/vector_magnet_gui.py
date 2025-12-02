@@ -82,11 +82,11 @@ class VectorMagnetGui(GuiBase):
         L.sigFieldReadback.connect(self._update_field_readback)
         L.sigCurrentReadback.connect(self._update_currents)
         L.sigSetpointRejected.connect(self._status_message)
-        L.sigRampProgress.connect(self._on_ramp_progress)
         L.sigQuenchState.connect(self._on_quench_state)
         L.sigLogEvent.connect(self._append_log)
         L.sigHeaterState.connect(self._on_heater_state)
         L.sigStatusText.connect(self._status_message)
+        L.sigRampActiveState.connect(self._on_ramp_active_state)
 
         # Actions
         w.applyCartesianButton.clicked.connect(self._apply_cartesian)
@@ -95,9 +95,13 @@ class VectorMagnetGui(GuiBase):
         w.fastSweepCheckBox.stateChanged.connect(self._fast_sweep_toggled)
         w.setRampRatesButton.clicked.connect(self._set_ramp_rates)
         w.emergencyStopButton.clicked.connect(L.emergency_stop)
+        w.stopRampButton.clicked.connect(L.stop_ramp)
         w.resetQuenchButton.clicked.connect(L.reset_quench)
         w.persistentCheckBox.toggled.connect(L.set_persistent_mode)
         w.optionBHoldLeadsRadio.toggled.connect(self._idle_behavior_changed)
+        w.hxToggleButton.clicked.connect(lambda: self.logic().toggle_axis_heater('x'))
+        w.hyToggleButton.clicked.connect(lambda: self.logic().toggle_axis_heater('y'))
+        w.hzToggleButton.clicked.connect(lambda: self.logic().toggle_axis_heater('z'))
 
     # ------------- Helpers -------------
 
@@ -199,8 +203,8 @@ class VectorMagnetGui(GuiBase):
         w.readIyLabel.setText(f"{d['Iy']:.4f}")
         w.readIzLabel.setText(f"{d['Iz']:.4f}")
 
-    def _on_ramp_progress(self, val: float):
-        self._widget.rampProgressBar.setValue(int(round(val * 100)))
+    def _on_ramp_active_state(self, active: bool):
+        self._widget.stopRampButton.setEnabled(bool(active))
 
     def _on_quench_state(self, info: dict):
         if info['quench']:
@@ -298,6 +302,13 @@ class _QtUiBuilder:
         w.hxStatusLabel = self._val_label(); w.hyStatusLabel = self._val_label(); w.hzStatusLabel = self._val_label()
         pmg.addWidget(w.hxStatusLabel, row, 0); pmg.addWidget(w.hyStatusLabel, row, 1); pmg.addWidget(w.hzStatusLabel, row, 2); row += 1
 
+        w.hxToggleButton = QtWidgets.QPushButton("Turn ON")
+        w.hyToggleButton = QtWidgets.QPushButton("Turn ON")
+        w.hzToggleButton = QtWidgets.QPushButton("Turn ON")
+        pmg.addWidget(w.hxToggleButton, row, 0)
+        pmg.addWidget(w.hyToggleButton, row, 1)
+        pmg.addWidget(w.hzToggleButton, row, 2); row += 1
+
         outer.addWidget(pm_group)
 
         # Ramp / Sweep Group
@@ -318,18 +329,18 @@ class _QtUiBuilder:
         w.fastSweepCheckBox = QtWidgets.QCheckBox("Fast Sweep")
         rsg.addWidget(w.fastSweepCheckBox, row, 0, 1, 3); row += 1
 
-        w.rampProgressBar = QtWidgets.QProgressBar(); w.rampProgressBar.setRange(0, 100)
-        rsg.addWidget(QtWidgets.QLabel("Progress:"), row, 0)
-        rsg.addWidget(w.rampProgressBar, row, 1, 1, 2); row += 1
-
         w.statusLabel = QtWidgets.QLabel("")
         rsg.addWidget(QtWidgets.QLabel("Status:"), row, 0)
         rsg.addWidget(w.statusLabel, row, 1, 1, 2); row += 1
 
+        w.stopRampButton = QtWidgets.QPushButton("Stop Ramp"); w.stopRampButton.setEnabled(False)
         w.emergencyStopButton = QtWidgets.QPushButton("Emergency Stop")
         w.resetQuenchButton = QtWidgets.QPushButton("Reset Quench"); w.resetQuenchButton.setEnabled(False)
-        rsg.addWidget(w.emergencyStopButton, row, 0, 1, 2)
-        rsg.addWidget(w.resetQuenchButton, row, 2); row += 1
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addWidget(w.stopRampButton)
+        btn_row.addWidget(w.emergencyStopButton)
+        btn_row.addWidget(w.resetQuenchButton)
+        rsg.addLayout(btn_row, row, 0, 1, 3);row += 1
 
         outer.addWidget(rs_group)
 

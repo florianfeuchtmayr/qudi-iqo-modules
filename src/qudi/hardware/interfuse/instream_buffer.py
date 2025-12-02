@@ -237,12 +237,29 @@ class DataInStreamMultiConsumerDelegate(QtCore.QObject):
             try:
                 if self._streamer.module_state() == 'idle':
                     self._streamer.start_stream()
+
                 if self.__worker is None:
+                    tm = ThreadManager.instance()
+                    thread = tm.get_new_thread(self._worker_thread)
+                    # Robustness: if manager returns None (stale name), clean up and fallback to unique name
+                    if thread is None:
+                        # Best-effort cleanup of stale entry
+                        try:
+                            tm.quit_thread(self._worker_thread)
+                            tm.join_thread(self._worker_thread)
+                        except Exception:
+                            pass
+                        # Fallback to a unique suffix
+                        self._worker_thread = f'{self._worker_thread}-{uuid.hex[:6]}'
+                        thread = tm.get_new_thread(self._worker_thread)
+                        if thread is None:
+                            raise RuntimeError('Failed to obtain worker QThread for DataInStreamBuffer delegate')
+
                     self.__worker = DataInStreamDistributionWorker(self._streamer, self._buffers)
-                    thread = ThreadManager.instance().get_new_thread(self._worker_thread)
                     self.__worker.moveToThread(thread)
                     thread.started.connect(self.__worker.run)
                     thread.start()
+
             except Exception:
                 self._clear_buffer(uuid)
                 raise
@@ -251,16 +268,22 @@ class DataInStreamMultiConsumerDelegate(QtCore.QObject):
         """ Stop the data acquisition/streaming """
         with self._lock:
             self._clear_buffer(uuid)
-            # Terminate streamer if all consumers have stopped listening
+            # If this was the last consumer, stop the worker thread and (optionally) the underlying streamer
             if all(buffer is None for buffer in self._buffers.values()):
+                tm = ThreadManager.instance()
                 try:
+                    # Freeze reads while stopping the worker
                     if self.__worker is not None:
                         for lock in self._read_locks.values():
                             lock.lock()
                         self.__worker.stop()
-                        tm = ThreadManager.instance()
+                    # Always try to shut down the thread by name (even if __worker is already None)
+                    try:
                         tm.quit_thread(self._worker_thread)
+                    finally:
                         tm.join_thread(self._worker_thread)
+
+                    # Stop the underlying streamer if we started it here and it is still locked
                     if self._streamer.module_state() == 'locked':
                         self._streamer.stop_stream()
                 finally:

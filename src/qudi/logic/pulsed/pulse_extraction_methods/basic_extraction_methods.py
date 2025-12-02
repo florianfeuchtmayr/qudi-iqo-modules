@@ -427,3 +427,54 @@ class BasicPulseExtractor(PulseExtractorBase):
                        'laser_indices_falling': np.arange(len(count_data))}
 
         return return_dict
+
+    def ungated_predefined(self, count_data, toffset=10e-9):
+
+        return_dict = {'laser_counts_arr': np.empty(0, dtype='int64'),
+                       'laser_indices_rising': np.empty(0, dtype='int64'),
+                       'laser_indices_falling': np.empty(0, dtype='int64')}
+
+        number_of_lasers = self.measurement_settings.get('number_of_lasers')
+        if not isinstance(number_of_lasers, int):
+            return return_dict
+
+        pg_bin_width = 1/self.sampling_information['pulse_generator_settings']['sample_rate']
+        fc_bin_width = self.fast_counter_settings['bin_width']
+
+        tmp_rising_pg_bins = self.sampling_information['laser_rising_bins']
+        tmp_falling_pg_bins = self.sampling_information['laser_falling_bins']
+
+        if tmp_rising_pg_bins[0] == 0:
+            tmp_rising_pg_bins = np.roll(tmp_rising_pg_bins, -1)
+            tmp_rising_pg_bins[-1] = self.sampling_information['number_of_samples']
+
+        if tmp_falling_pg_bins[0]<tmp_rising_pg_bins[0]:
+            laser_rising_pg_bins = tmp_falling_pg_bins
+            laser_falling_pg_bins = tmp_rising_pg_bins
+        else:
+            laser_rising_pg_bins = tmp_rising_pg_bins
+            laser_falling_pg_bins = tmp_falling_pg_bins
+
+        laser_rising_times = laser_rising_pg_bins*pg_bin_width + toffset
+        laser_falling_times = laser_falling_pg_bins*pg_bin_width + toffset
+
+        laser_rising_indices = np.floor(laser_rising_times / fc_bin_width).astype(int)
+        laser_falling_indices = np.ceil(laser_falling_times / fc_bin_width).astype(int)
+
+        laser_length = int(np.max(laser_falling_indices - laser_rising_indices))
+
+        # initialize the empty output array
+        laser_arr = np.zeros((number_of_lasers, laser_length), dtype='int64')
+        # slice the detected laser pulses of the timetrace and save them in the
+        # output array according to the found rising edge
+        for i in range(number_of_lasers):
+            if laser_rising_indices[i] + laser_length > count_data.size:
+                lenarr = count_data[laser_rising_indices[i]:].size
+                laser_arr[i, 0:lenarr] = count_data[laser_rising_indices[i]:]
+            else:
+                laser_arr[i] = count_data[laser_rising_indices[i]:laser_rising_indices[i] + laser_length]
+
+        return_dict['laser_counts_arr'] = laser_arr.astype('int64')
+        return_dict['laser_indices_rising'] = laser_rising_indices
+        return_dict['laser_indices_falling'] = laser_falling_indices
+        return return_dict

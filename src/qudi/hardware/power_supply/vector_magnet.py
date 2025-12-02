@@ -133,6 +133,11 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
     _vector_field_limit_T: float = ConfigOption('vector_field_limit_T', default=0.5, missing='warn')
     _max_field_T: float = ConfigOption('max_field_T', default=0.5, missing='warn')
     _ramp_rates: Dict[str, float] = ConfigOption('ramp_rates_A_per_s', missing='error')
+    _uniform_rate_enabled: bool = ConfigOption('uniform_rate_enabled', default=True, missing='nothing')
+    _fast_rate_enabled: bool = ConfigOption('fast_rate_enabled', default=False, missing='nothing')
+    _error_reporting_enabled: bool = ConfigOption('error_reporting_enabled', default=False, missing='nothing')
+    _force_units: str = ConfigOption('force_units', default='A', missing='nothing')  # 'A' or 'G'
+    _fast_ramp_rates: Dict[str, float] = ConfigOption('fast_ramp_rates_A_per_s', default={}, missing='nothing')
     _current_tolerance_A: float = ConfigOption('current_tolerance_A', default=0.01, missing='nothing')
 
     _heater_warmup_s: float = ConfigOption('heater_warmup_s', default=10.0, missing='nothing')
@@ -294,7 +299,62 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
     # ---------------- Public API (Interface Implementation) ----------------
 
     def set_axis_ramp_rate(self, axis: str, rate_A_per_s: float):
+        """Store desired ramp rate and, if uniform mode, program RATE 0..4 uniformly."""
         self._ramp_rates[axis] = float(rate_A_per_s)
+        if not self._uniform_rate_enabled:
+            return  # user disabled automatic programming
+        port = self._dual_port if axis in ('x', 'y') else self._single_port
+        if port is None:
+            return
+        with self._mutex:
+            if axis in ('x', 'y'):
+                self._write(port, f'CHAN {self._axis_chan[axis]}')
+                time.sleep(0.05)
+                self._collect_bytes(port, 0.15, 0.04)
+            self._program_all_ranges_rate(port, rate_A_per_s)
+            # Optional fast rate override
+            if self._fast_rate_enabled:
+                fast_rate = self._fast_ramp_rates.get(axis, rate_A_per_s)
+                self._program_fast_rate(port, fast_rate)
+
+    def set_axis_fast_ramp_rate(self, axis: str, rate_A_per_s: float):
+        """Set separate fast mode ramp rate (RATE 5) for an axis."""
+        self._fast_ramp_rates[axis] = float(rate_A_per_s)
+        if not self._fast_rate_enabled:
+            return
+        port = self._dual_port if axis in ('x', 'y') else self._single_port
+        if port is None:
+            return
+        with self._mutex:
+            if axis in ('x', 'y'):
+                self._write(port, f'CHAN {self._axis_chan[axis]}')
+                time.sleep(0.05)
+                self._collect_bytes(port, 0.15, 0.04)
+            self._program_fast_rate(port, rate_A_per_s)
+
+    def _program_all_ranges_rate(self, port, rate: float):
+        """Program the same sweep rate for ranges 0..4 (normal ranges)."""
+        try:
+            r = float(rate)
+        except Exception:
+            return
+        for rng in range(0, 5):
+            try:
+                self._write(port, f'RATE {rng} {r:.6f}')
+                time.sleep(0.02)
+            except Exception:
+                continue
+
+    def _program_fast_rate(self, port, rate: float):
+        """Program fast mode rate (range 5) if enabled."""
+        try:
+            r = float(rate)
+        except Exception:
+            return
+        try:
+            self._write(port, f'RATE 5 {r:.6f}')
+        except Exception:
+            pass
 
     def start_axis_sweep(self, axis: str, target_A: float, fast: bool = False):
         if not self._use_native_sweep or axis not in ('x', 'y', 'z'):
@@ -319,7 +379,6 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
                 time.sleep(0.10)
                 self._collect_bytes(port, 0.18, 0.04)
 
-            # Configure ULIM/LLIM and issue sweep
             if direction_up:
                 self._write(port, f'LLIM {min(current, target_A):.6f}')
                 self._write(port, f'ULIM {target_A:.6f}')

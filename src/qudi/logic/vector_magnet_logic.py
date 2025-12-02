@@ -53,7 +53,6 @@ class VectorMagnetLogic(Base):
       sigCurrentReadback(dict)  -> Ix,Iy,Iz (A)
       sigSetpointAccepted(dict)
       sigSetpointRejected(str)
-      sigRampProgress(float 0..1)
       sigModeUpdate(dict)       -> persistent state updates
       sigQuenchState(dict)      -> {'quench': bool, 'axes': list[str]}
       sigLogEvent(str)
@@ -96,12 +95,12 @@ class VectorMagnetLogic(Base):
     sigCurrentReadback = QtCore.Signal(dict)
     sigSetpointAccepted = QtCore.Signal(dict)
     sigSetpointRejected = QtCore.Signal(str)
-    sigRampProgress = QtCore.Signal(float)
     sigModeUpdate = QtCore.Signal(dict)
     sigQuenchState = QtCore.Signal(dict)
     sigLogEvent = QtCore.Signal(str)
     sigHeaterState = QtCore.Signal(dict)
     sigStatusText = QtCore.Signal(str)
+    sigRampActiveState = QtCore.Signal(bool)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -126,9 +125,9 @@ class VectorMagnetLogic(Base):
         self._target_currents: Dict[str, float] = {'x': 0.0, 'y': 0.0, 'z': 0.0}
         self._ramp_start_currents: Dict[str, float] = {}
         self._last_sweep_states: Dict[str, str] = {'x': '', 'y': '', 'z': ''}
+        self._paused_axes: set[str] = set()
 
         # Timers / logging
-        self._ramp_progress_timer: Optional[QtCore.QTimer] = None
         self._log_file_handle = None
 
     # ---------------- Lifecycle ----------------
@@ -162,16 +161,12 @@ class VectorMagnetLogic(Base):
         hw.sigAxisStatus.connect(self._on_axis_status)
         hw.sigQuench.connect(self._on_quench_detected)
 
-        # Ramp progress timer
-        self._ramp_progress_timer = QtCore.QTimer(self)
-        self._ramp_progress_timer.setInterval(self._ramp_progress_update_ms)
-        self._ramp_progress_timer.timeout.connect(self._update_ramp_progress)
-
         # Initial mode broadcast
         self.sigModeUpdate.emit({
             'persistent_enabled': self._persistent_enabled,
             'persistent_idle_behavior': self._persistent_idle_behavior
         })
+        self.sigRampActiveState.emit(False)
 
     def on_deactivate(self):
         if self._log_file_handle:
@@ -190,6 +185,19 @@ class VectorMagnetLogic(Base):
         self.sigLogEvent.emit(line)
 
     # ---------------- Public API (GUI) ----------------
+
+    def set_axis_heater(self, axis: str, on: bool):
+        """Manually set a single heater ON/OFF from the GUI."""
+        if axis not in ('x', 'y', 'z'):
+            return
+        self.hardware().set_axis_heater(axis, bool(on))
+        self._log(f'HEATER_SET axis={axis} on={bool(on)}')
+        self.sigStatusText.emit(f"Heater {axis.upper()} {'ON' if on else 'OFF'} request sent.")
+
+    def toggle_axis_heater(self, axis: str):
+        """Toggle heater state for one axis."""
+        current = self._heater_states.get(axis, False)
+        self.set_axis_heater(axis, not current)
 
     def set_persistent_mode(self, enable: bool):
         if self._quench_active:
@@ -224,13 +232,11 @@ class VectorMagnetLogic(Base):
 
         def _do_zero():
             self.hardware().sweep_zero(fast=fast)
-            # Treat as ramp for progress
             self._target_currents.update({'x': 0.0, 'y': 0.0, 'z': 0.0})
             self._ramping_axes = {'x', 'y', 'z'}
-            self._ramp_start_currents.clear()
-            if self._ramp_progress_timer and not self._ramp_progress_timer.isActive():
-                self._ramp_progress_timer.start()
+            self._paused_axes.clear()
             self.sigStatusText.emit("Zero-all sweep started.")
+            self.sigRampActiveState.emit(True)
 
         QtCore.QTimer.singleShot(max(0, int(round(self._heater_warmup_s * 1000.0))), _do_zero)
 
@@ -251,6 +257,10 @@ class VectorMagnetLogic(Base):
         """Immediately sweep zero (non-fast) and stop progress tracking."""
         self._log('EMERGENCY_STOP_REQUEST')
         self.hardware().sweep_zero(fast=False)
+        # Treat as aborted ramp
+        self._ramping_axes.clear()
+        self._paused_axes.clear()
+        self._post_ramp_finalize(aborted=True)
         self.sigStatusText.emit("Emergency stop: sweeping to zero.")
 
     def reset_quench(self):
@@ -261,6 +271,33 @@ class VectorMagnetLogic(Base):
         self._log('QUENCH_RESET')
         self.sigQuenchState.emit({'quench': False, 'axes': []})
         self.sigStatusText.emit("Quench reset.")
+
+    def stop_ramp(self):
+        """Pause ongoing sweeps (SWEEP PAUSE) and allow new setpoints without emergency zero."""
+        if not self._ramping_axes:
+            return
+        hw = self.hardware()
+        for ax in list(self._ramping_axes):
+            self._pause_axis(ax, hw)
+        self._paused_axes.update(self._ramping_axes)
+        self._ramping_axes.clear()
+        self._log('RAMP_PAUSED')
+        self.sigStatusText.emit("Ramp paused.")
+        # Heaters remain ON; user may change setpoint now.
+        self.sigRampActiveState.emit(False)
+
+    def _pause_axis(self, axis: str, hw):
+        # Send SWEEP PAUSE for axis
+        try:
+            if axis in ('x', 'y'):
+                hw._write(hw._dual_port, f'CHAN {hw._axis_chan[axis]}')
+                time.sleep(0.05)
+                hw._collect_bytes(hw._dual_port, 0.15, 0.04)
+                hw._write(hw._dual_port, 'SWEEP PAUSE')
+            else:
+                hw._write(hw._single_port, 'SWEEP PAUSE')
+        except Exception:
+            pass
 
     # ---------------- Internal Field Setting & Ramping ----------------
 
@@ -310,132 +347,120 @@ class VectorMagnetLogic(Base):
     # ... inside class VectorMagnetLogic ...
 
     def _begin_ramps(self, fast: bool):
-        """
-        Issue native sweeps, but only after ensuring the heaters are ON and warmed up.
-        Prefer magnet current (IMAG) for 'do we need to move?' decisions to avoid
-        false positives from stray IOUT values.
-        """
         hw = self.hardware()
         self._ramping_axes.clear()
         self._ramp_start_currents.clear()
+        self._paused_axes.clear()
 
-        # Determine axes needing ramping (prefer IMAG; fall back to IOUT only if IMAG is NaN)
         needing: list[str] = []
         for ax in ('x', 'y', 'z'):
             curr = hw.get_axis_magnet_current(ax, fresh=True)
             if math.isnan(curr):
                 curr = hw.get_axis_current(ax, fresh=True)
             if math.isnan(curr):
-                # Unknown yet; we'll retry shortly if we have no axes
                 continue
             tgt = self._target_currents[ax]
             if abs(tgt - curr) > self._current_tolerance_A:
                 needing.append(ax)
 
         if not needing:
-            # If some cached values are still NaN, retry shortly; otherwise finalize
-            if any(math.isnan(hw.get_axis_magnet_current(a, fresh=True)) and
-                   math.isnan(hw.get_axis_current(a, fresh=True))
-                   for a in ('x', 'y', 'z')):
-                QtCore.QTimer.singleShot(250, lambda: self._begin_ramps(fast=fast))
+            self._post_ramp_finalize()
+            return
+
+        if self._persistent_enabled:
+            # Persistent: handle each axis separately depending on heater state
+            for ax in needing:
+                if not self._heater_states.get(ax, False):
+                    # Heater OFF: we must first match IOUT to IMAG
+                    self._log(f'PERSISTENT_PREP axis={ax}')
+                    self._ramp_axis_persistent_sequence(ax, fast)
+                else:
+                    # Heater already ON: just do a warm-up delay then final sweep
+                    hw.set_axis_heater(ax, True)
+                    QtCore.QTimer.singleShot(
+                        int(round(self._heater_warmup_s * 1000.0)),
+                        lambda a=ax: self._start_axis_final_sweep(a, fast)
+                    )
+        else:
+            # Non-persistent: turn all heaters ON and ramp after warm-up collectively
+            for ax in needing:
+                hw.set_axis_heater(ax, True)
+            QtCore.QTimer.singleShot(
+                int(round(self._heater_warmup_s * 1000.0)),
+                lambda: [self._start_axis_final_sweep(a, fast) for a in needing]
+            )
+
+    def _ramp_axis_persistent_sequence(self, axis: str, fast: bool):
+        """
+        Persistent mode sequence:
+          1. Ramp supply output (IOUT) to stored magnet current IMAG with heater OFF.
+          2. When |IOUT - IMAG| <= tolerance, turn heater ON.
+          3. After warm-up, perform final sweep to target current.
+        """
+        hw = self.hardware()
+        imag = hw.get_axis_magnet_current(axis, fresh=True)
+        if math.isnan(imag):
+            imag = hw.get_axis_current(axis, fresh=True)
+        if math.isnan(imag):
+            QtCore.QTimer.singleShot(250, lambda: self._ramp_axis_persistent_sequence(axis, fast))
+            return
+
+        # Step 1: ramp supply to IMAG (using existing start_axis_sweep abstraction)
+        hw.start_axis_sweep(axis, imag, fast=False)
+        self._log(f'PERSISTENT_MATCH axis={axis} imag={imag:.5f}A')
+
+        def _check_match():
+            iout = hw.get_axis_current(axis, fresh=True)
+            im2 = hw.get_axis_magnet_current(axis, fresh=True)
+            if math.isnan(iout) or math.isnan(im2):
+                QtCore.QTimer.singleShot(300, _check_match)
                 return
-            self._post_ramp_finalize()
-            return
-
-        # 1) Ensure heaters ON for all ramping axes
-        for ax in needing:
-            hw.set_axis_heater(ax, True)
-
-        # 2) Warm-up delay before starting sweeps so persistent switches really open
-        delay_ms = max(0, int(round(self._heater_warmup_s * 1000.0)))
-        QtCore.QTimer.singleShot(delay_ms, lambda: self._start_sweeps_after_warmup(needing, fast))
-
-    def _start_sweeps_after_warmup(self, axes_to_ramp: list[str], fast: bool):
-        """Called after heater warm-up time; actually start sweeps and begin progress tracking."""
-        hw = self.hardware()
-
-        started_any = False
-        for ax in axes_to_ramp:
-            # Prefer magnet current for the final delta check
-            curr = hw.get_axis_magnet_current(ax, fresh=True)
-            if math.isnan(curr):
-                curr = hw.get_axis_current(ax, fresh=True)
-            tgt = self._target_currents[ax]
-            if math.isnan(curr) or abs(tgt - curr) <= self._current_tolerance_A:
-                continue
-            self._ramping_axes.add(ax)
-            self._ramp_start_currents[ax] = curr
-            hw.start_axis_sweep(ax, tgt, fast=fast)
-            started_any = True
-
-        if started_any and self._ramp_progress_timer and not self._ramp_progress_timer.isActive():
-            self._ramp_progress_timer.start()
-
-    # ---------------- Ramp Progress ----------------
-
-    def _update_ramp_progress(self):
-        """Compute ramp progress as max fraction among ramping axes."""
-        hw = self.hardware()
-        if not self._ramping_axes:
-            self.sigRampProgress.emit(1.0)
-            if self._ramp_progress_timer:
-                self._ramp_progress_timer.stop()
-            return
-
-        max_fraction = 0.0
-        completed: List[str] = []
-
-        for ax in list(self._ramping_axes):
-            curr = hw.get_axis_magnet_current(ax, fresh=True)
-            if math.isnan(curr):
-                curr = hw.get_axis_current(ax, fresh=True)
-            tgt = self._target_currents[ax]
-            start = self._ramp_start_currents.get(ax, tgt if tgt != 0 else 1.0)
-
-            # Normalize span: use start if target near zero to avoid noise plateau
-            if abs(tgt) < 5 * self._current_tolerance_A:
-                span = max(abs(start), 5 * self._current_tolerance_A)
+            if abs(iout - im2) <= self._current_tolerance_A:
+                # Step 2: heater ON
+                hw.set_axis_heater(axis, True)
+                self._log(f'PERSISTENT_HEATER_ON axis={axis}')
+                # Warm-up delay then final sweep
+                QtCore.QTimer.singleShot(
+                    int(round(self._heater_warmup_s * 1000.0)),
+                    lambda: self._start_axis_final_sweep(axis, fast)
+                )
             else:
-                span = max(abs(tgt), self._current_tolerance_A)
+                QtCore.QTimer.singleShot(300, _check_match)
 
-            fraction = 1.0 - min(1.0, abs(tgt - curr) / span)
+        _check_match()
 
-            # If hardware already reports standby, snap to completion if close
-            sweep_state = self._last_sweep_states.get(ax, '')
-            if sweep_state.lower().startswith('standby') and fraction > 0.95:
-                fraction = 1.0
-
-            max_fraction = max(max_fraction, fraction)
-
-            if abs(tgt - curr) <= self._current_tolerance_A or fraction >= 0.999:
-                completed.append(ax)
-
-        for ax in completed:
-            self._ramping_axes.discard(ax)
-
-        self.sigRampProgress.emit(max_fraction if self._ramping_axes else 1.0)
-
-        if not self._ramping_axes:
-            if self._ramp_progress_timer:
-                self._ramp_progress_timer.stop()
-            self._log('RAMP_COMPLETE')
-            self.sigStatusText.emit("Ramp complete.")
-            self._post_ramp_finalize()
+    def _start_axis_final_sweep(self, axis: str, fast: bool):
+        """Issue final sweep to target current after heater warm-up."""
+        hw = self.hardware()
+        tgt = self._target_currents[axis]
+        curr = hw.get_axis_magnet_current(axis, fresh=True)
+        if math.isnan(curr):
+            curr = hw.get_axis_current(axis, fresh=True)
+        if math.isnan(curr) or abs(tgt - curr) <= self._current_tolerance_A:
+            return
+        hw.start_axis_sweep(axis, tgt, fast=fast)
+        self._ramping_axes.add(axis)
+        self._ramp_start_currents[axis] = curr
+        self._log(f'FINAL_SWEEP axis={axis} target={tgt:.5f}A')
+        self.sigRampActiveState.emit(True)
 
     # ---------------- Post-Ramp Handling ----------------
 
-    def _post_ramp_finalize(self):
+    def _post_ramp_finalize(self, aborted: bool = False):
         """Handle heater state after ramp depending on persistent mode."""
         hw = self.hardware()
-        if self._persistent_enabled:
-            # Turn heaters OFF (simulate locking flux)
-            for ax in ('x', 'y', 'z'):
-                hw.set_axis_heater(ax, False)
-            self._log('PERSISTENT_FINALIZATION (heaters off)')
-            self.sigStatusText.emit("Persistent lock: heaters off.")
+        if aborted:
+            self.sigStatusText.emit("Ramp aborted.")
         else:
-            self._log('NO_PERSISTENT_FINALIZATION (heaters left on)')
-            self.sigStatusText.emit("At setpoint (heaters on).")
+            if self._persistent_enabled:
+                for ax in ('x', 'y', 'z'):
+                    hw.set_axis_heater(ax, False)
+                self._log('PERSISTENT_FINALIZATION (heaters off)')
+                self.sigStatusText.emit("Persistent lock: heaters off.")
+            else:
+                self._log('NO_PERSISTENT_FINALIZATION (heaters left on)')
+                self.sigStatusText.emit("At setpoint (heaters on).")
+        self.sigRampActiveState.emit(False)
 
     # ---------------- Hardware Status Event Handlers ----------------
 
@@ -462,14 +487,10 @@ class VectorMagnetLogic(Base):
             except Exception:
                 return False
 
-        # Policy: either IMAG-when-heater-off, or always prefer IOUT
         if self._field_use_imag_when_heater_off and (not heater_on):
-            # Heater OFF policy: IMAG preferred, else IOUT
             val = imag if isnum(imag) else (iout if isnum(iout) else 0.0)
         else:
-            # Default policy: IOUT preferred, else IMAG
             val = iout if isnum(iout) else (imag if isnum(imag) else 0.0)
-
         if abs(val) < eps:
             return 0.0
         return val
@@ -509,17 +530,39 @@ class VectorMagnetLogic(Base):
         for ax in ('x', 'y', 'z'):
             self._last_sweep_states[ax] = status[ax].get('SWEEP', '')
             self._heater_states[ax] = status[ax]['heater']
-
         self.sigHeaterState.emit(dict(self._heater_states))
+
+        # Completion evaluation (without progress timer):
+        if self._ramping_axes:
+            finished: List[str] = []
+            tol = float(self._current_tolerance_A)
+            for ax in list(self._ramping_axes):
+                # Use freshest magnet current if available, otherwise supply current
+                curr = hw.get_axis_magnet_current(ax, fresh=True)
+                if math.isnan(curr):
+                    curr = hw.get_axis_current(ax, fresh=True)
+
+                tgt = self._target_currents.get(ax, curr)
+                if (not math.isnan(curr)) and (abs(tgt - curr) <= tol):
+                    # Axis reached target: pause native sweep to stop motion, mark finished
+                    self._pause_axis(ax, hw)
+                    finished.append(ax)
+
+            for ax in finished:
+                self._ramping_axes.discard(ax)
+
+            if not self._ramping_axes:
+                # All axes finished: finalize heaters depending on persistent mode
+                self._log('RAMP_COMPLETE')
+                self._post_ramp_finalize(aborted=False)
 
     @QtCore.Slot(dict)
     def _on_quench_detected(self, axes: Dict[str, bool]):
         if not self._quench_active:
             self._quench_active = True
             self._log(f'QUENCH_DETECTED axes={list(axes.keys())}')
-            # Stop ramp tracking
-            if self._ramp_progress_timer and self._ramp_progress_timer.isActive():
-                self._ramp_progress_timer.stop()
             self._ramping_axes.clear()
+            self._paused_axes.clear()
             self.sigQuenchState.emit({'quench': True, 'axes': list(axes.keys())})
             self.sigStatusText.emit("QUENCH detected – reset required.")
+            self.sigRampActiveState.emit(False)
