@@ -317,13 +317,6 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
             ni.set_sample_rate(self._ni_sample_rate_hz)
         except Exception:
             pass
-        # Active channels in the order we present to the GUI/logic
-        active_list = tuple(self._ni_channel_mapping[present] for present in self._present_channels)
-        try:
-            ni.set_active_channels(channels=active_list)
-        except Exception:
-            # Some backends may be fixed by config; ignore if unsupported
-            pass
 
     def configure_back_scan(self, settings: ScanSettings) -> None:
         """ Configure the hardware with all parameters of the backwards scan.
@@ -777,22 +770,13 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
 
     # Worker: software-stepped scan
     def _run_scan_worker(self):
-        """
-        Worker during the step-scan.
-
-        Two motion modes are supported:
-        - 'per_pixel_closed_loop' (default): closed-loop to every pixel
-        - 'linewise_open_fast': closed-loop at the start of each line, open-loop along fast axis pixels
-
-        Data acquisition uses the NI streamer and writes directly into ScanData.data arrays.
-        """
         try:
             settings = self._scan_data.settings if self._scan_data else None
             data = self._scan_data
             if settings is None or data is None:
                 raise RuntimeError('Scan not configured')
 
-            # Build axis vectors from settings
+            # Build axis vectors
             axes_names = list(settings.axes)
             axis_values: List[np.ndarray] = []
             for i, ax in enumerate(axes_names):
@@ -800,10 +784,8 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                 n = int(settings.resolution[i])
                 axis_values.append(np.linspace(float(mn), float(mx), n))
 
-            # Decide fast axis index for motion
             fast_idx = 0
-            if len(axes_names) == 2 and isinstance(self._preferred_fast_axis,
-                                                   str) and self._preferred_fast_axis in axes_names:
+            if len(axes_names) == 2 and isinstance(self._preferred_fast_axis, str) and self._preferred_fast_axis in axes_names:
                 fast_idx = axes_names.index(self._preferred_fast_axis)
             fast_ax = axes_names[fast_idx]
             fast_vals = axis_values[fast_idx]
@@ -816,7 +798,7 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                 slow_vals = axis_values[slow_idx]
                 ny_slow = int(settings.resolution[slow_idx])
 
-            # Dynamic closed-loop window (nm) from pixel pitch (use max across axes)
+            # Window size for closed-loop moves
             pixel_sizes_m: List[float] = []
             for i, ax in enumerate(axes_names):
                 mn, mx = settings.range[i]
@@ -830,140 +812,136 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                 raise ValueError('Scan frequency must be > 0. Set it in the Scanner GUI.')
             dwell_s = 1.0 / float(settings.frequency)
             ni: DataInStreamInterface = self._ni_in()
-            sample_rate = float(self._ni_sample_rate_hz)
+            # CRITICAL: use the actual device sample rate to compute samples per pixel.
+            try:
+                sample_rate = float(getattr(ni, 'sample_rate'))
+            except Exception:
+                sample_rate = float(self._ni_sample_rate_hz)  # fallback
             samples_per_pixel = max(1, int(round(sample_rate * dwell_s)))
 
-            # Determine buffer dtype and active channel order on device
-            buf_dtype = getattr(getattr(ni, 'constraints', object()), 'data_type', np.float64)
+            # Active channel names
             try:
-                active_ni_channels = list(ni.get_active_channels())
+                active_ni_channels = list(getattr(ni, 'active_channels'))
             except Exception:
-                active_ni_channels = list(self._ni_channels_in_order)
-            stream_ch_count = max(1, len(active_ni_channels))
+                try:
+                    active_ni_channels = list(ni.get_active_channels())
+                except Exception:
+                    active_ni_channels = []
 
-            # Map presented alias -> active stream index
+            normalized_active = []
+            for name in active_ni_channels:
+                try:
+                    normalized_active.append(str(name).split('/')[-1])
+                except Exception:
+                    continue
+
+            if not normalized_active:
+                if self._ni_channels_in_order:
+                    normalized_active = [str(n) for n in self._ni_channels_in_order]
+                else:
+                    normalized_active = ['PFI8']
+
+            stream_ch_count = max(1, len(normalized_active))
+
+            # Map presented alias -> index
             present_to_active_idx: Dict[str, int] = {}
             for alias in self._present_channels:
-                ni_name = self._present_to_ni.get(alias)
+                ni_name = self._present_to_ni.get(alias, '')
+                idx = -1
                 try:
-                    present_to_active_idx[alias] = active_ni_channels.index(ni_name)
+                    idx = normalized_active.index(ni_name)
                 except ValueError:
-                    present_to_active_idx[alias] = -1
-                    self.log.warning(f'NI channel {ni_name} for {alias} is not active in streamer.')
+                    if stream_ch_count == 1 and len(self._present_channels) == 1:
+                        idx = 0
+                present_to_active_idx[alias] = idx
+                if idx < 0:
+                    self.log.warning(f'NI channel {ni_name} for {alias} is not active in streamer. Active={normalized_active}')
 
-            # Local helper: read one pixel worth of data and aggregate per presented channel
-            def _acquire_and_aggregate() -> Dict[str, float]:
-                channel_means: Dict[str, float] = {}
-                samples_obj = None
-                # Preferred dict/list/array API
-                if hasattr(ni, 'read_data'):
-                    try:
-                        samples_obj = ni.read_data(samples_per_channel=samples_per_pixel)
-                    except Exception:
-                        samples_obj = None
+            buf_dtype = getattr(getattr(ni, 'constraints', object()), 'data_type', np.float64)
 
-                if isinstance(samples_obj, dict):
-                    for alias in self._present_channels:
-                        ni_name = self._present_to_ni.get(alias)
-                        arr = None
-                        if ni_name in samples_obj:
-                            arr = np.asarray(samples_obj[ni_name])
-                        else:
-                            idx = present_to_active_idx.get(alias, -1)
-                            if idx in samples_obj:
-                                arr = np.asarray(samples_obj[idx])
-                        if arr is None:
-                            channel_means[alias] = np.nan
-                        else:
-                            unit = self._input_channel_units.get(alias, '')
-                            channel_means[alias] = float(np.sum(arr)) if unit == 'c/s' else float(np.mean(arr))
-                    return channel_means
-
-                if isinstance(samples_obj, (list, tuple)):
-                    for alias in self._present_channels:
-                        idx = present_to_active_idx.get(alias, -1)
-                        if idx < 0 or idx >= len(samples_obj):
-                            channel_means[alias] = np.nan
-                            continue
-                        arr = np.asarray(samples_obj[idx])
-                        unit = self._input_channel_units.get(alias, '')
-                        channel_means[alias] = float(np.sum(arr)) if unit == 'c/s' else float(np.mean(arr))
-                    return channel_means
-
-                if isinstance(samples_obj, np.ndarray):
-                    arr = np.asarray(samples_obj)
-                    if arr.ndim == 2:
-                        # (channels, samples) or (samples, channels)
-                        if arr.shape == (stream_ch_count, samples_per_pixel):
-                            for alias in self._present_channels:
-                                idx = present_to_active_idx.get(alias, -1)
-                                if idx < 0 or idx >= stream_ch_count:
-                                    channel_means[alias] = np.nan
-                                    continue
-                                ch_slice = arr[idx, :]
-                                unit = self._input_channel_units.get(alias, '')
-                                channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(
-                                    np.mean(ch_slice))
-                            return channel_means
-                        if arr.shape == (samples_per_pixel, stream_ch_count):
-                            for alias in self._present_channels:
-                                idx = present_to_active_idx.get(alias, -1)
-                                if idx < 0 or idx >= stream_ch_count:
-                                    channel_means[alias] = np.nan
-                                    continue
-                                ch_slice = arr[:, idx]
-                                unit = self._input_channel_units.get(alias, '')
-                                channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(
-                                    np.mean(ch_slice))
-                            return channel_means
-                        # Unexpected 2D shape → fall through to buffer API
-                    elif arr.ndim == 1 and arr.size == stream_ch_count * samples_per_pixel:
-                        # Interleaved 1D
-                        for alias in self._present_channels:
-                            idx = present_to_active_idx.get(alias, -1)
-                            if idx < 0 or idx >= stream_ch_count:
-                                channel_means[alias] = np.nan
-                                continue
-                            ch_slice = arr[idx::stream_ch_count][:samples_per_pixel]
-                            unit = self._input_channel_units.get(alias, '')
-                            channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(
-                                np.mean(ch_slice))
-                        return channel_means
-                    # Else: fall through to buffer API
-
-                # Buffer API fallback: interleaved for all active channels
-                interleaved = np.zeros(stream_ch_count * samples_per_pixel, dtype=buf_dtype)
+            # Flush helper: drain all currently available samples so next read starts "now"
+            def _drain_stream() -> None:
                 try:
-                    ni.read_data_into_buffer(interleaved, samples_per_channel=samples_per_pixel)
+                    # Try fast-path if provided by buffer wrapper
+                    total = 0
+                    scratch = np.empty(stream_ch_count * 4096, dtype=buf_dtype)
+                    while True:
+                        avail = getattr(ni, 'available_samples', 0)
+                        if avail <= 0:
+                            break
+                        n = int(min(avail, scratch.size // stream_ch_count))
+                        if n <= 0:
+                            break
+                        try:
+                            read = ni.read_available_data_into_buffer(scratch, None)
+                        except AttributeError:
+                            # Fallback: blocking read for currently available
+                            ni.read_data_into_buffer(scratch[:n * stream_ch_count], samples_per_channel=n)
+                            read = n
+                        if read <= 0:
+                            break
+                        total += read
                 except Exception:
-                    self.log.exception('Getting samples from streamer failed. Stopping streamer.')
-                    try:
-                        ni.stop_stream()
-                    except Exception:
-                        pass
-                    raise
+                    # Never fail the scan if flushing fails
+                    pass
+
+            # Digital/rate detection
+            def _is_digital_like(arr: np.ndarray) -> bool:
+                # Treat as digital if values are close to 0/1
+                if arr.size < 4:
+                    return False
+                vmin = float(np.nanmin(arr))
+                vmax = float(np.nanmax(arr))
+                return (vmin >= -0.25) and (vmax <= 1.25)
+
+            # Acquire exactly one pixel window (after flush) and aggregate per channel
+            def _acquire_and_aggregate() -> Dict[str, float]:
+                # Discard any stale samples from before this pixel
+                _drain_stream()
+
+                # Now pull exactly the dwell window
+                interleaved = np.zeros(stream_ch_count * samples_per_pixel, dtype=buf_dtype)
+                ni.read_data_into_buffer(interleaved, samples_per_channel=samples_per_pixel)
+
+                channel_vals: Dict[str, float] = {}
                 for alias in self._present_channels:
                     idx = present_to_active_idx.get(alias, -1)
                     if idx < 0 or idx >= stream_ch_count:
-                        channel_means[alias] = np.nan
+                        channel_vals[alias] = np.nan
                         continue
                     ch_slice = interleaved[idx::stream_ch_count][:samples_per_pixel]
-                    unit = self._input_channel_units.get(alias, '')
-                    channel_means[alias] = float(np.sum(ch_slice)) if unit == 'c/s' else float(np.mean(ch_slice))
-                return channel_means
 
-            # Motion and scan geometry shortcuts
+                    unit = (self._input_channel_units.get(alias, '') or '').strip().lower()
+                    ni_name = (self._present_to_ni.get(alias, '') or '').lower()
+
+                    # Heuristic:
+                    # - If values look like rates (not near {0,1}), just average (this matches TimeSeries).
+                    # - If values look digital-like and unit is 'c/s', do rising-edge counting → counts/s.
+                    # - Otherwise, average.
+                    looks_digital = _is_digital_like(ch_slice)
+                    if unit == 'c/s' and looks_digital:
+                        bin_slice = (ch_slice > 0.5).astype(np.uint8)
+                        # Rising edges 0 -> 1
+                        edge_count = int(np.count_nonzero((bin_slice[1:] == 1) & (bin_slice[:-1] == 0)))
+                        dwell = float(samples_per_pixel) / float(sample_rate) if sample_rate > 0 else np.nan
+                        channel_vals[alias] = (edge_count / dwell) if dwell and dwell > 0 else np.nan
+                    else:
+                        # Average (works for rate-like outputs and analog)
+                        channel_vals[alias] = float(np.mean(ch_slice))
+
+                return channel_vals
+
+            # Motion shortcut
             motion = self._motion()
 
-            # Branch on scan motion mode
+            # ... below: unchanged scan loops, but each place that reads a pixel uses ch_means = _acquire_and_aggregate() ...
+
             if self._scan_motion_mode == 'linewise_open_fast':
-                # Direct array access (writes in-place)
                 data_dict = data.data
                 if data_dict is None:
                     raise RuntimeError('ScanData.data not initialized. Did you call data.new_scan()?')
 
                 if not is_2d:
-                    # 1D: assume we are already at first pixel.
                     for p in range(nx_fast):
                         if self._stop_requested:
                             break
@@ -972,15 +950,12 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                             time.sleep(self._settle_time_s)
 
                         ch_means = _acquire_and_aggregate()
-                        counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
                         idx_tuple = (p,)
-                        for ch_name, val in zip(self._present_channels, counts):
+                        for ch_name in self._present_channels:
                             arr = data_dict.get(ch_name)
                             if arr is not None:
-                                arr[idx_tuple] = val
-
+                                arr[idx_tuple] = ch_means.get(ch_name, np.nan)
                 else:
-                    # 2D: for each line, closed-loop to line start; then open-loop pixels on fast axis
                     for l in range(ny_slow):
                         if self._stop_requested:
                             break
@@ -1004,16 +979,12 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                                 motion.move_absolute({fast_ax: float(fast_vals[p])}, blocking=True)
                                 time.sleep(self._settle_time_s)
                             ch_means = _acquire_and_aggregate()
-                            counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
-                            # Write in ORIGINAL axes order expected by GUI
                             idx_tuple = (p, l) if fast_idx == 0 else (l, p)
-                            for ch_name, val in zip(self._present_channels, counts):
+                            for ch_name in self._present_channels:
                                 arr = data_dict.get(ch_name)
                                 if arr is not None:
-                                    arr[idx_tuple] = val
-
+                                    arr[idx_tuple] = ch_means.get(ch_name, np.nan)
             else:
-                # 'per_pixel_closed_loop' (x-fast, y-slow in data indexing when fast_idx==0)
                 data_dict = data.data
                 if data_dict is None:
                     raise RuntimeError('ScanData.data not initialized. Did you call data.new_scan()?')
@@ -1039,16 +1010,14 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                         time.sleep(self._settle_time_s)
 
                         ch_means = _acquire_and_aggregate()
-                        counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
                         idx_tuple = (p,)
-                        for ch_name, val in zip(self._present_channels, counts):
+                        for ch_name in self._present_channels:
                             arr = data_dict.get(ch_name)
                             if arr is not None:
-                                arr[idx_tuple] = val
-
+                                arr[idx_tuple] = ch_means.get(ch_name, np.nan)
                 else:
-                    for l in range(ny_slow):  # slow axis outer
-                        for p in range(nx_fast):  # fast axis inner
+                    for l in range(ny_slow):
+                        for p in range(nx_fast):
                             if self._stop_requested:
                                 break
                             pos = {fast_ax: float(fast_vals[p]), slow_ax: float(slow_vals[l])}
@@ -1068,15 +1037,13 @@ class AMC300NIScanningProbeInterfuse(ScanningProbeInterface):
                             time.sleep(self._settle_time_s)
 
                             ch_means = _acquire_and_aggregate()
-                            counts = [ch_means.get(alias, np.nan) for alias in self._present_channels]
-                            # Write in ORIGINAL axes order expected by GUI
                             idx_tuple = (p, l) if fast_idx == 0 else (l, p)
-                            for ch_name, val in zip(self._present_channels, counts):
+                            for ch_name in self._present_channels:
                                 arr = data_dict.get(ch_name)
                                 if arr is not None:
-                                    arr[idx_tuple] = val
+                                    arr[idx_tuple] = ch_means.get(ch_name, np.nan)
 
-            # Finish scans
+            # Finish scan (unchanged)
             try:
                 data.finish_scan()
             except Exception:
