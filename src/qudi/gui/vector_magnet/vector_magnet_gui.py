@@ -87,11 +87,11 @@ class VectorMagnetGui(GuiBase):
         L.sigHeaterState.connect(self._on_heater_state)
         L.sigStatusText.connect(self._status_message)
         L.sigRampActiveState.connect(self._on_ramp_active_state)
+        L.sigModeUpdate.connect(self._on_mode_update)
 
         # Actions
         w.applyCartesianButton.clicked.connect(self._apply_cartesian)
         w.applySphericalButton.clicked.connect(self._apply_spherical)
-        w.zeroAllButton.clicked.connect(self._zero_all)
         w.fastSweepCheckBox.stateChanged.connect(self._fast_sweep_toggled)
         w.setRampRatesButton.clicked.connect(self._set_ramp_rates)
         w.emergencyStopButton.clicked.connect(L.emergency_stop)
@@ -104,6 +104,35 @@ class VectorMagnetGui(GuiBase):
         w.hzToggleButton.clicked.connect(lambda: self.logic().toggle_axis_heater('z'))
 
     # ------------- Helpers -------------
+
+    def _on_mode_update(self, info: dict):
+        """
+        Update GUI controls to reflect persistent mode and idle behavior.
+        info keys:
+          - 'persistent_enabled': bool
+          - 'persistent_idle_behavior': 'hold_leads' or 'zero_leads'
+        """
+        w = self._widget
+        persistent = bool(info.get('persistent_enabled', False))
+        idle_beh = str(info.get('persistent_idle_behavior', 'hold_leads'))
+
+        try:
+            w.persistentCheckBox.blockSignals(True)
+            w.optionAZeroLeadsRadio.blockSignals(True)
+            w.optionBHoldLeadsRadio.blockSignals(True)
+
+            w.persistentCheckBox.setChecked(persistent)
+            if idle_beh == 'hold_leads':
+                w.optionBHoldLeadsRadio.setChecked(True)
+                w.optionAZeroLeadsRadio.setChecked(False)
+            else:
+                w.optionAZeroLeadsRadio.setChecked(True)
+                w.optionBHoldLeadsRadio.setChecked(False)
+        finally:
+            w.persistentCheckBox.blockSignals(False)
+            w.optionAZeroLeadsRadio.blockSignals(False)
+            w.optionBHoldLeadsRadio.blockSignals(False)
+        w.optionAZeroLeadsRadio.setEnabled(persistent)
 
     @staticmethod
     def _val_or_zero(edit: QtWidgets.QLineEdit) -> float:
@@ -144,18 +173,15 @@ class VectorMagnetGui(GuiBase):
         self.logic().request_set_field_spherical(bmag, theta, phi, fast=self._fast_sweep_enabled)
         # Status handled by logic via sigStatusText
 
-    def _zero_all(self):
-        self.logic().zero_all(fast=False)
-        self._status_message("Zero-all sweep issued.")
-
     def _fast_sweep_toggled(self, state: int):
         self._fast_sweep_enabled = (state == QtCore.Qt.Checked)
         self._status_message(f"Fast sweep {'ON' if self._fast_sweep_enabled else 'OFF'}")
 
     def _idle_behavior_changed(self):
+        """Radio toggle handler: set persistent idle behavior in logic."""
         if self._widget.optionBHoldLeadsRadio.isChecked():
             self.logic().set_persistent_idle_behavior('hold_leads')
-        else:
+        elif self._widget.optionAZeroLeadsRadio.isChecked():
             self.logic().set_persistent_idle_behavior('zero_leads')
 
     def _set_ramp_rates(self):
@@ -198,10 +224,21 @@ class VectorMagnetGui(GuiBase):
             w.readPhiLabel.setText("--")
 
     def _update_currents(self, d: dict):
+        """Show both supply (IOUT) and magnet (IMAG) currents, plus effective if desired."""
         w = self._widget
-        w.readIxLabel.setText(f"{d['Ix']:.4f}")
-        w.readIyLabel.setText(f"{d['Iy']:.4f}")
-        w.readIzLabel.setText(f"{d['Iz']:.4f}")
+        # Supply currents (IOUT)
+        w.readIxLabel.setText(f"{d.get('Ix_out', float('nan')):.4f}")
+        w.readIyLabel.setText(f"{d.get('Iy_out', float('nan')):.4f}")
+        w.readIzLabel.setText(f"{d.get('Iz_out', float('nan')):.4f}")
+        # Magnet currents (IMAG)
+        try:
+            w.readIxMagLabel.setText(f"{d.get('Ix_mag', float('nan')):.4f}")
+            w.readIyMagLabel.setText(f"{d.get('Iy_mag', float('nan')):.4f}")
+            w.readIzMagLabel.setText(f"{d.get('Iz_mag', float('nan')):.4f}")
+        except AttributeError:
+            # If labels do not exist (first run), ignore
+            pass
+
 
     def _on_ramp_active_state(self, active: bool):
         self._widget.stopRampButton.setEnabled(bool(active))
@@ -261,10 +298,6 @@ class _QtUiBuilder:
         w.phiEdit = QtWidgets.QLineEdit(); w.phiEdit.setPlaceholderText("φ (deg)")
         sg.addWidget(w.bmagEdit, row, 0); sg.addWidget(w.thetaEdit, row, 1); sg.addWidget(w.phiEdit, row, 2); row += 1
 
-        # Zero All
-        w.zeroAllButton = QtWidgets.QPushButton("Zero All")
-        sg.addWidget(w.zeroAllButton, row, 0, 1, 3); row += 1
-
         outer.addWidget(set_group)
 
         # Readback Group
@@ -280,9 +313,15 @@ class _QtUiBuilder:
         w.readBmagLabel = self._val_label(); w.readThetaLabel = self._val_label(); w.readPhiLabel = self._val_label()
         rgb.addWidget(w.readBmagLabel, row, 0); rgb.addWidget(w.readThetaLabel, row, 1); rgb.addWidget(w.readPhiLabel, row, 2); row += 1
 
-        rgb.addWidget(QtWidgets.QLabel("Currents (I_x, I_y, I_z) [A]:"), row, 0, 1, 3); row += 1
+        # Supply currents (IOUT)
+        rgb.addWidget(QtWidgets.QLabel("Supply Currents IOUT (I_x, I_y, I_z) [A]:"), row, 0, 1, 3); row += 1
         w.readIxLabel = self._val_label(); w.readIyLabel = self._val_label(); w.readIzLabel = self._val_label()
         rgb.addWidget(w.readIxLabel, row, 0); rgb.addWidget(w.readIyLabel, row, 1); rgb.addWidget(w.readIzLabel, row, 2); row += 1
+
+        # Magnet currents (IMAG)
+        rgb.addWidget(QtWidgets.QLabel("Magnet Currents IMAG (I_x, I_y, I_z) [A]:"), row, 0, 1, 3); row += 1
+        w.readIxMagLabel = self._val_label(); w.readIyMagLabel = self._val_label(); w.readIzMagLabel = self._val_label()
+        rgb.addWidget(w.readIxMagLabel, row, 0); rgb.addWidget(w.readIyMagLabel, row, 1); rgb.addWidget(w.readIzMagLabel, row, 2); row += 1
 
         outer.addWidget(rb_group)
 
@@ -293,7 +332,6 @@ class _QtUiBuilder:
         w.persistentCheckBox = QtWidgets.QCheckBox("Persistent")
         w.optionAZeroLeadsRadio = QtWidgets.QRadioButton("Idle Zero Leads")
         w.optionBHoldLeadsRadio = QtWidgets.QRadioButton("Idle Hold Leads")
-        w.optionAZeroLeadsRadio.setChecked(True)
         pmg.addWidget(w.persistentCheckBox, row, 0)
         pmg.addWidget(w.optionAZeroLeadsRadio, row, 1)
         pmg.addWidget(w.optionBHoldLeadsRadio, row, 2); row += 1
@@ -334,7 +372,7 @@ class _QtUiBuilder:
         rsg.addWidget(w.statusLabel, row, 1, 1, 2); row += 1
 
         w.stopRampButton = QtWidgets.QPushButton("Stop Ramp"); w.stopRampButton.setEnabled(False)
-        w.emergencyStopButton = QtWidgets.QPushButton("Emergency Stop")
+        w.emergencyStopButton = QtWidgets.QPushButton("Zero All")
         w.resetQuenchButton = QtWidgets.QPushButton("Reset Quench"); w.resetQuenchButton.setEnabled(False)
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addWidget(w.stopRampButton)

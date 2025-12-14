@@ -82,9 +82,8 @@ class VectorMagnetLogic(Base):
     _reject_mid_ramp: bool = ConfigOption('reject_new_setpoint_while_ramping', default=True, missing='nothing')
     _log_to_file: bool = ConfigOption('log_to_file', default=True, missing='nothing')
     _log_file_basename: str = ConfigOption('log_file_basename', default='vector_magnet_log.txt', missing='nothing')
-    _ramp_progress_update_ms: int = ConfigOption('ramp_progress_update_ms', default=300, missing='nothing')
     _field_use_imag_when_heater_off: bool = ConfigOption(
-        'field_use_imag_when_heater_off', default=False, missing='nothing'
+        'field_use_imag_when_heater_off', default=True, missing='nothing'
     )
     _field_zero_epsilon_A: float = ConfigOption(
         'field_zero_epsilon_A', default=1e-4, missing='nothing'
@@ -126,6 +125,7 @@ class VectorMagnetLogic(Base):
         self._ramp_start_currents: Dict[str, float] = {}
         self._last_sweep_states: Dict[str, str] = {'x': '', 'y': '', 'z': ''}
         self._paused_axes: set[str] = set()
+        self._consec_in_tol_counts: Dict[str, int] = {'x': 0, 'y': 0, 'z': 0}
 
         # Timers / logging
         self._log_file_handle = None
@@ -136,7 +136,7 @@ class VectorMagnetLogic(Base):
         hw = self.hardware()
         hw.sigCommunicationError.connect(lambda msg: self._log("HW_COMM " + msg))
 
-        # Calibration & limits
+        # Calibration & limits (unchanged)
         self._M_diag = dict(hw._cal_diag)
         self._Minv_diag = {ax: 1.0 / v for ax, v in self._M_diag.items()}
         self._max_currents = dict(hw._max_currents)
@@ -147,21 +147,16 @@ class VectorMagnetLogic(Base):
             self._heater_warmup_s = float(hw._heater_warmup_s)
         except Exception:
             self._heater_warmup_s = 5.0
-        self._persistent_enabled = hw._default_persistent
-        self._persistent_idle_behavior = hw._persistent_idle_behavior
 
-        # Logging
-        if self._log_to_file:
-            log_dir = hw._log_directory or os.getcwd()
-            os.makedirs(log_dir, exist_ok=True)
-            path = os.path.join(log_dir, self._log_file_basename)
-            self._log_file_handle = open(path, 'a', buffering=1)
+        # Read defaults from hardware config and publish to GUI
+        self._persistent_enabled = bool(hw._default_persistent)
+        self._persistent_idle_behavior = str(hw._persistent_idle_behavior or 'hold_leads')
 
         # Hardware status signals
         hw.sigAxisStatus.connect(self._on_axis_status)
         hw.sigQuench.connect(self._on_quench_detected)
 
-        # Initial mode broadcast
+        # Initial mode broadcast to synchronize GUI
         self.sigModeUpdate.emit({
             'persistent_enabled': self._persistent_enabled,
             'persistent_idle_behavior': self._persistent_idle_behavior
@@ -169,6 +164,16 @@ class VectorMagnetLogic(Base):
         self.sigRampActiveState.emit(False)
 
     def on_deactivate(self):
+        # Disconnect hardware signals to avoid late calls during shutdown
+        try:
+            self.hardware().sigAxisStatus.disconnect(self._on_axis_status)
+        except Exception:
+            pass
+        try:
+            self.hardware().sigQuench.disconnect(self._on_quench_detected)
+        except Exception:
+            pass
+
         if self._log_file_handle:
             try:
                 self._log_file_handle.close()
@@ -200,20 +205,39 @@ class VectorMagnetLogic(Base):
         self.set_axis_heater(axis, not current)
 
     def set_persistent_mode(self, enable: bool):
+        """Enable/disable persistent mode. If disabling, force idle behavior to hold_leads."""
         if self._quench_active:
             self.sigSetpointRejected.emit('Quench active – cannot toggle persistent mode.')
             return
         self._persistent_enabled = bool(enable)
+
+        # When persistent is disabled, zero_leads is not meaningful; force hold_leads.
+        if not self._persistent_enabled and (self._persistent_idle_behavior != 'hold_leads'):
+            self._persistent_idle_behavior = 'hold_leads'
+            self._log('PERSISTENT_IDLE_FORCED_TO_HOLD_LEADS')
+
         self._log(f'PERSISTENT_MODE_SET {self._persistent_enabled}')
-        self.sigModeUpdate.emit({'persistent_enabled': self._persistent_enabled})
+        self.sigModeUpdate.emit({
+            'persistent_enabled': self._persistent_enabled,
+            'persistent_idle_behavior': self._persistent_idle_behavior
+        })
         self.sigStatusText.emit(f"Persistent mode {'enabled' if enable else 'disabled'}.")
 
     def set_persistent_idle_behavior(self, behavior: str):
+        """Set idle behavior. If selecting zero_leads while not persistent, auto-enable persistent."""
         if behavior not in ('zero_leads', 'hold_leads'):
             return
+        # If user requests zero_leads and persistent is OFF, turn persistent ON automatically.
+        if behavior == 'zero_leads' and (not self._persistent_enabled):
+            self._persistent_enabled = True
+            self._log('PERSISTENT_AUTO_ENABLED_FOR_ZERO_LEADS')
+
         self._persistent_idle_behavior = behavior
         self._log(f'PERSISTENT_IDLE_BEHAVIOR {behavior}')
-        self.sigModeUpdate.emit({'persistent_idle_behavior': behavior})
+        self.sigModeUpdate.emit({
+            'persistent_enabled': self._persistent_enabled,
+            'persistent_idle_behavior': self._persistent_idle_behavior
+        })
         self.sigStatusText.emit(f"Idle behavior set: {behavior.replace('_', ' ')}")
 
     def set_axis_ramp_rate(self, axis: str, rate_A_per_s: float):
@@ -221,24 +245,6 @@ class VectorMagnetLogic(Base):
         self._log(f'RAMP_RATE_SET axis={axis} rate={rate_A_per_s}')
 
     # ... inside class VectorMagnetLogic ...
-
-    def zero_all(self, fast: bool = False):
-        """Sweep all axes to zero with proper heater gating."""
-        self._log('ZERO_ALL_REQUEST')
-
-        # Turn heaters ON for all axes and warm up, then issue zero sweep
-        for ax in ('x', 'y', 'z'):
-            self.hardware().set_axis_heater(ax, True)
-
-        def _do_zero():
-            self.hardware().sweep_zero(fast=fast)
-            self._target_currents.update({'x': 0.0, 'y': 0.0, 'z': 0.0})
-            self._ramping_axes = {'x', 'y', 'z'}
-            self._paused_axes.clear()
-            self.sigStatusText.emit("Zero-all sweep started.")
-            self.sigRampActiveState.emit(True)
-
-        QtCore.QTimer.singleShot(max(0, int(round(self._heater_warmup_s * 1000.0))), _do_zero)
 
     def request_set_field_cartesian(self, Bx_mT: float, By_mT: float, Bz_mT: float, fast: bool = False):
         self._set_field_internal(Bx_mT / 1000.0, By_mT / 1000.0, Bz_mT / 1000.0, fast=fast)
@@ -400,8 +406,6 @@ class VectorMagnetLogic(Base):
         hw = self.hardware()
         imag = hw.get_axis_magnet_current(axis, fresh=True)
         if math.isnan(imag):
-            imag = hw.get_axis_current(axis, fresh=True)
-        if math.isnan(imag):
             QtCore.QTimer.singleShot(250, lambda: self._ramp_axis_persistent_sequence(axis, fast))
             return
 
@@ -451,15 +455,41 @@ class VectorMagnetLogic(Base):
         hw = self.hardware()
         if aborted:
             self.sigStatusText.emit("Ramp aborted.")
-        else:
-            if self._persistent_enabled:
-                for ax in ('x', 'y', 'z'):
+            self.sigRampActiveState.emit(False)
+            return
+
+        if self._persistent_enabled:
+            # Turn heaters OFF (persistent lock); magnet stays at its stored current.
+            for ax in ('x', 'y', 'z'):
+                try:
                     hw.set_axis_heater(ax, False)
-                self._log('PERSISTENT_FINALIZATION (heaters off)')
-                self.sigStatusText.emit("Persistent lock: heaters off.")
+                except Exception:
+                    pass
+
+            if self._persistent_idle_behavior == 'zero_leads':
+                # Optional: zero leads in persistent mode. This won't affect the magnet current.
+                try:
+                    # Use native sweep zero (per-axis) rather than zero-all so we keep GUI/logic simple.
+                    # If you prefer zero-all, you can call hw.sweep_zero(fast=False) instead.
+                    hw.start_axis_sweep('x', 0.0, fast=False)
+                    hw.start_axis_sweep('y', 0.0, fast=False)
+                    hw.start_axis_sweep('z', 0.0, fast=False)
+                    self._log('PERSISTENT_FINALIZATION (heaters off, leads swept to zero)')
+                    self.sigStatusText.emit("Persistent lock: heaters off; leads swept to zero.")
+                except Exception:
+                    # Non-fatal
+                    self._log('PERSISTENT_FINALIZATION error sweeping leads to zero')
+                    self.sigStatusText.emit("Persistent lock: heaters off; sweep-to-zero failed.")
             else:
-                self._log('NO_PERSISTENT_FINALIZATION (heaters left on)')
-                self.sigStatusText.emit("At setpoint (heaters on).")
+                # hold_leads: do nothing to the supply outputs
+                self._log('PERSISTENT_FINALIZATION (heaters off; leads held)')
+                self.sigStatusText.emit("Persistent lock: heaters off; leads held.")
+
+        else:
+            # Non-persistent: leave heaters ON at setpoint
+            self._log('NO_PERSISTENT_FINALIZATION (heaters left on)')
+            self.sigStatusText.emit("At setpoint (heaters on).")
+
         self.sigRampActiveState.emit(False)
 
     # ---------------- Hardware Status Event Handlers ----------------
@@ -469,8 +499,8 @@ class VectorMagnetLogic(Base):
         Choose the current used to compute the field for this axis.
 
         Default (recommended when IMAG is stale on idle axes):
-        - Prefer IOUT (supply output) always.
-        - Fall back to IMAG only if IOUT is NaN/unavailable.
+        - Prefer IMAG (supply output) always.
+        - Fall back to IOUT only if IMAG is NaN/unavailable.
         - Clamp very small magnitudes to 0 using _field_zero_epsilon_A.
 
         Optional (enable via field_use_imag_when_heater_off=True):
@@ -478,7 +508,6 @@ class VectorMagnetLogic(Base):
         """
         iout = st.get('IOUT')
         imag = st.get('IMAG')
-        heater_on = bool(st.get('heater', False))
         eps = float(self._field_zero_epsilon_A)
 
         def isnum(x):
@@ -487,74 +516,89 @@ class VectorMagnetLogic(Base):
             except Exception:
                 return False
 
-        if self._field_use_imag_when_heater_off and (not heater_on):
-            val = imag if isnum(imag) else (iout if isnum(iout) else 0.0)
-        else:
-            val = iout if isnum(iout) else (imag if isnum(imag) else 0.0)
+        # Prefer IMAG regardless of heater state; fall back to IOUT
+        val = imag if isnum(imag) else (iout if isnum(iout) else 0.0)
         if abs(val) < eps:
             return 0.0
         return val
 
     @QtCore.Slot(dict)
     def _on_axis_status(self, status: Dict[str, dict]):
-        """Update field and current readbacks, heater states, sweep states."""
-        hw = self.hardware()
+        """Update readbacks and perform ramp completion tracking without extra hardware queries."""
+        try:
+            # Effective currents for field computation
+            ix_eff = self._current_for_field(status['x'])
+            iy_eff = self._current_for_field(status['y'])
+            iz_eff = self._current_for_field(status['z'])
 
-        # Effective coil currents for field computation (policy above)
-        ix_eff = self._current_for_field(status['x'])
-        iy_eff = self._current_for_field(status['y'])
-        iz_eff = self._current_for_field(status['z'])
+            # Field from diagonal calibration (cached)
+            Bx = ix_eff * self._M_diag.get('x', 0.0)
+            By = iy_eff * self._M_diag.get('y', 0.0)
+            Bz = iz_eff * self._M_diag.get('z', 0.0)
+            Bmag = math.sqrt(Bx * Bx + By * By + Bz * Bz)
 
-        # Field from diagonal calibration
-        Bx = ix_eff * hw._cal_diag['x']
-        By = iy_eff * hw._cal_diag['y']
-        Bz = iz_eff * hw._cal_diag['z']
-        Bmag = math.sqrt(Bx * Bx + By * By + Bz * Bz)
+            scale = 1000.0 if self._field_units.lower() == 'mt' else 1.0
+            self.sigFieldReadback.emit({
+                'Bx_mT': Bx * scale,
+                'By_mT': By * scale,
+                'Bz_mT': Bz * scale,
+                'Bmag_mT': Bmag * scale
+            })
 
-        scale = 1000.0 if self._field_units.lower() == 'mt' else 1.0
-        self.sigFieldReadback.emit({
-            'Bx_mT': Bx * scale,
-            'By_mT': By * scale,
-            'Bz_mT': Bz * scale,
-            'Bmag_mT': Bmag * scale
-        })
+            # Emit both supply and magnet currents, plus effective
+            self.sigCurrentReadback.emit({
+                'Ix_out': status['x'].get('IOUT', float('nan')),
+                'Iy_out': status['y'].get('IOUT', float('nan')),
+                'Iz_out': status['z'].get('IOUT', float('nan')),
+                'Ix_mag': status['x'].get('IMAG', float('nan')),
+                'Iy_mag': status['y'].get('IMAG', float('nan')),
+                'Iz_mag': status['z'].get('IMAG', float('nan')),
+                'Ix_eff': ix_eff,
+                'Iy_eff': iy_eff,
+                'Iz_eff': iz_eff,
+            })
 
-        # Keep showing supply outputs for current readback (unchanged)
-        self.sigCurrentReadback.emit({
-            'Ix': status['x']['IOUT'],
-            'Iy': status['y']['IOUT'],
-            'Iz': status['z']['IOUT']
-        })
+            # Update sweep & heater states
+            for ax in ('x', 'y', 'z'):
+                self._last_sweep_states[ax] = status[ax].get('SWEEP', '')
+                self._heater_states[ax] = status[ax].get('heater', False)
+            self.sigHeaterState.emit(dict(self._heater_states))
 
-        # Update sweep & heater states
-        for ax in ('x', 'y', 'z'):
-            self._last_sweep_states[ax] = status[ax].get('SWEEP', '')
-            self._heater_states[ax] = status[ax]['heater']
-        self.sigHeaterState.emit(dict(self._heater_states))
+            # Completion evaluation using already computed effective currents
+            if self._ramping_axes:
+                finished: List[str] = []
+                tol = float(self._current_tolerance_A)
+                eff_map = {'x': ix_eff, 'y': iy_eff, 'z': iz_eff}
+                for ax in list(self._ramping_axes):
+                    curr_eff = eff_map[ax]
+                    tgt = self._target_currents.get(ax, curr_eff)
+                    if (not math.isnan(curr_eff)) and (abs(tgt - curr_eff) <= tol):
+                        # Track consecutive in-tolerance polls
+                        self._consec_in_tol_counts[ax] = self._consec_in_tol_counts.get(ax, 0) + 1
+                        if self._consec_in_tol_counts[ax] >= 3:
+                            # Pause native sweep to stop motion, mark finished
+                            try:
+                                hw = self.hardware()
+                                self._pause_axis(ax, hw)
+                            except Exception:
+                                # If hardware already disconnected, skip pausing gracefully
+                                pass
+                            finished.append(ax)
+                    else:
+                        # Reset consecutive count if out of tolerance
+                        self._consec_in_tol_counts[ax] = 0
 
-        # Completion evaluation (without progress timer):
-        if self._ramping_axes:
-            finished: List[str] = []
-            tol = float(self._current_tolerance_A)
-            for ax in list(self._ramping_axes):
-                # Use freshest magnet current if available, otherwise supply current
-                curr = hw.get_axis_magnet_current(ax, fresh=True)
-                if math.isnan(curr):
-                    curr = hw.get_axis_current(ax, fresh=True)
+                for ax in finished:
+                    self._ramping_axes.discard(ax)
+                    self._consec_in_tol_counts[ax] = 0
 
-                tgt = self._target_currents.get(ax, curr)
-                if (not math.isnan(curr)) and (abs(tgt - curr) <= tol):
-                    # Axis reached target: pause native sweep to stop motion, mark finished
-                    self._pause_axis(ax, hw)
-                    finished.append(ax)
+                if not self._ramping_axes:
+                    self._log('RAMP_COMPLETE')
+                    self._post_ramp_finalize(aborted=False)
 
-            for ax in finished:
-                self._ramping_axes.discard(ax)
-
-            if not self._ramping_axes:
-                # All axes finished: finalize heaters depending on persistent mode
-                self._log('RAMP_COMPLETE')
-                self._post_ramp_finalize(aborted=False)
+        except Exception as exc:
+            # Be defensive in shutdown: do not propagate fatal errors
+            self._log(f'LOGIC_STATUS_ERROR {exc}')
 
     @QtCore.Slot(dict)
     def _on_quench_detected(self, axes: Dict[str, bool]):

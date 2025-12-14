@@ -146,6 +146,15 @@ class TimeTaggerFastCounter(FastCounterInterface):
         # Keep conservative defaults; pulsed logic can rebin in software if needed
         return {
             'hardware_binwidth_list': [
+                1000e-9,       # 1000 ns
+                500e-9,        # 500 ns
+                200e-9,        # 200 ns
+                100e-9,        # 100 ns
+                50e-9,         # 50 ns
+                20e-9,         # 20 ns
+                10e-9,         # 10 ns
+                5e-9,          # 5 ns
+                2e-9,          # 2 ns
                 1.0 / 1000e6,  # 1 ns
                 0.5e-9,        # 0.5 ns
                 0.2e-9,        # 0.2 ns
@@ -251,7 +260,7 @@ class TimeTaggerFastCounter(FastCounterInterface):
 
     def is_gated(self):
         """This counter is used in gated/pulsed mode."""
-        return False
+        return True
 
     def get_data_trace(self):
         """

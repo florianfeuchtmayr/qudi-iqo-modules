@@ -428,7 +428,7 @@ class BasicPulseExtractor(PulseExtractorBase):
 
         return return_dict
 
-    def ungated_predefined(self, count_data, toffset=10e-9):
+    def gated_predefined(self, count_data, toffset=10e-9):
 
         return_dict = {'laser_counts_arr': np.empty(0, dtype='int64'),
                        'laser_indices_rising': np.empty(0, dtype='int64'),

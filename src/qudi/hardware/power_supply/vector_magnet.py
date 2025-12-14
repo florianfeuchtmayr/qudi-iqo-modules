@@ -338,7 +338,7 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
             r = float(rate)
         except Exception:
             return
-        for rng in range(0, 5):
+        for rng in range(1, 4):
             try:
                 self._write(port, f'RATE {rng} {r:.6f}')
                 time.sleep(0.02)
@@ -359,19 +359,32 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
     def start_axis_sweep(self, axis: str, target_A: float, fast: bool = False):
         if not self._use_native_sweep or axis not in ('x', 'y', 'z'):
             return
-        current = self.get_axis_current(axis, fresh=False)
-        if math.isnan(current):
-            current = 0.0
-        if abs(target_A - current) <= self._current_tolerance_A:
-            return
 
-        direction_up = target_A > current
         if axis in ('x', 'y'):
             port = self._dual_port
             chan = self._axis_chan[axis]
         else:
             port = self._single_port
             chan = None
+
+        current = self.get_axis_current(axis, fresh=False)
+        if math.isnan(current):
+            current = 0.0
+        if abs(target_A - current) <= self._current_tolerance_A:
+            return
+
+        # If target is essentially zero, use native SWEEP ZERO on the specific axis
+        zero_eps = max(self._current_tolerance_A, 1e-6)
+        if abs(target_A) <= zero_eps:
+            with self._mutex:
+                if chan is not None:
+                    self._write(port, f'CHAN {chan}')
+                    time.sleep(0.10)
+                    self._collect_bytes(port, 0.18, 0.04)
+                self._write(port, 'SWEEP ZERO' + (' FAST' if fast else ''))
+            return
+
+        direction_up = target_A > current
 
         with self._mutex:
             if chan is not None:
@@ -411,18 +424,18 @@ class VectorMagnetHardware(VectorMagnetHardwareInterface):
                 if axis in ('x', 'y'):
                     chan = self._axis_chan[axis]
                     self._write(self._dual_port, f'CHAN {chan}')
-                    time.sleep(0.05)
-                    self._collect_bytes(self._dual_port, 0.15, 0.04)
+                    time.sleep(0.1)
+                    self._collect_bytes(self._dual_port, 0.25, 0.05)
                     self._write(self._dual_port, f'PSHTR {"ON" if on else "OFF"}')
                     # Confirm a few times
-                    for _ in range(10):
+                    for _ in range(5):
                         time.sleep(0.1)
                         resp = self._safe_query(self._dual_port, 'PSHTR?') or ''
                         if bool(resp.startswith('1')) == bool(on):
                             break
                 elif axis == 'z':
                     self._write(self._single_port, f'PSHTR {"ON" if on else "OFF"}')
-                    for _ in range(10):
+                    for _ in range(5):
                         time.sleep(0.1)
                         resp = self._safe_query(self._single_port, 'PSHTR?') or ''
                         if bool(resp.startswith('1')) == bool(on):
