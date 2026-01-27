@@ -98,6 +98,10 @@ class HighFinesseWavemeter(DataInStreamInterface):
         self._timestamp_buffer: Optional[np.ndarray] = None
         self._current_buffer_position = 0
         self._buffer_overflow = False
+        # Track which switch channels are currently active in the HF GUI
+        self._hf_active_set: set[int] = set()
+        # Placeholder value used for inactive channels (choose 0.0 or 1.0 as you prefer)
+        self._inactive_placeholder_value: float = 0.0
 
         # stored hardware constraints
         self._constraints: Optional[DataInStreamConstraints] = None
@@ -153,6 +157,11 @@ class HighFinesseWavemeter(DataInStreamInterface):
 
     def start_stream(self) -> None:
         """ Start the data acquisition/streaming """
+        # Snapshot the currently active switch channels in the HF GUI
+        try:
+            self._hf_active_set = set(self._proxy().get_active_channels())
+        except Exception:
+            self._hf_active_set = set()
         with self._lock:
             if self.module_state() == 'idle':
                 self.module_state.lock()
@@ -375,17 +384,17 @@ class HighFinesseWavemeter(DataInStreamInterface):
             try:
                 i = self._active_switch_channels.index(ch)
             except ValueError:
-                # channel is not active on this instreamer
+                # channel is not part of this instreamer
                 return
 
-        if self._last_measurement_error[ch] != 0:
+        if self._last_measurement_error.get(ch, 0) != 0:
             if wavelength > 0:
                 # reset error flag
                 self._last_measurement_error[ch] = 0
 
         if wavelength <= 0:
             # negative values indicate an error
-            if self._last_measurement_error[ch] != wavelength:
+            if self._last_measurement_error.get(ch, 0) != wavelength:
                 # error is new
                 self._last_measurement_error[ch] = wavelength
                 self.log.warning(f'The last wavemeter measurement of channel {ch} was unsuccessful '
@@ -402,27 +411,45 @@ class HighFinesseWavemeter(DataInStreamInterface):
                     'Please increase the buffer size or speed up data reading.'
                 )
 
-            # unit conversion
+            # Unit conversion
             if self._channel_units[ch] == 'Hz':
                 converted_value = lambda2nu(wavelength)
             else:
                 converted_value = wavelength
 
-            # check if this is the first time this callback runs during a stream
+            # Initialize stream start time once
             if self._wm_start_time is None:
-                # set the timing offset to the start of the stream
                 self._wm_start_time = timestamp
+            rel_timestamp = timestamp - self._wm_start_time
 
-            if i != self._current_buffer_position % number_of_channels:
-                # discard the sample if a sample was missed before and the buffer position is off
-                return
+            # Advance the interleave position; only fill placeholders for channels that are HF-inactive.
+            # For HF-active channels, preserve original behavior: discard out-of-order callbacks.
+            expected_index = self._current_buffer_position % number_of_channels
+            while expected_index != i:
+                expected_ch = self._active_switch_channels[expected_index]
+                if expected_ch not in self._hf_active_set:
+                    # This expected slot belongs to an HF-inactive channel: write placeholder and advance.
+                    self._data_buffer[self._current_buffer_position] = self._inactive_placeholder_value
+                    if expected_index == 0:
+                        # Set a timestamp for the first slot in each interleave group
+                        self._timestamp_buffer[current_timestamp_buffer_position] = rel_timestamp
+                    self._current_buffer_position += 1
+                    expected_index = self._current_buffer_position % number_of_channels
+                    current_timestamp_buffer_position = self._current_buffer_position // number_of_channels
+                    if current_timestamp_buffer_position >= self.channel_buffer_size:
+                        self._buffer_overflow = True
+                        raise OverflowError(
+                            'Streaming buffer encountered an overflow while receiving a callback from the wavemeter. '
+                            'Please increase the buffer size or speed up data reading.'
+                        )
+                else:
+                    # The missing slot is for an HF-active channel; this callback is out-of-order. Discard it.
+                    return
 
-            timestamp -= self._wm_start_time
-            # insert the new data into the buffers
+            # Now write the real sample at the correct interleave slot
             self._data_buffer[self._current_buffer_position] = converted_value
             if i == 0:
-                # only record the timestamp of the first active channel
-                self._timestamp_buffer[current_timestamp_buffer_position] = timestamp
+                self._timestamp_buffer[current_timestamp_buffer_position] = rel_timestamp
             self._current_buffer_position += 1
 
         self.sigNewWavelength.emit(converted_value)
