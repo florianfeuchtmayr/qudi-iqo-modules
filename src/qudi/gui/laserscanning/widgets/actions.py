@@ -22,7 +22,7 @@ If not, see <https://www.gnu.org/licenses/>.
 __all__ = ['LaserScanningActions']
 
 import os
-from PySide2 import QtWidgets, QtGui
+from PySide6 import QtWidgets, QtGui
 
 from qudi.util.paths import get_artwork_dir
 
@@ -30,33 +30,34 @@ from qudi.util.paths import get_artwork_dir
 class LaserScanningActions:
     """ """
 
-    action_close: QtWidgets.QAction
-    action_save: QtWidgets.QAction
-    action_show_fit_configuration: QtWidgets.QAction
-    action_start_stop_record: QtWidgets.QAction
-    action_start_stop_scan: QtWidgets.QAction
-    action_clear_data: QtWidgets.QAction
-    action_show_frequency: QtWidgets.QAction
-    action_autoscale_histogram: QtWidgets.QAction
-    action_show_histogram_region: QtWidgets.QAction
-    action_restore_view: QtWidgets.QAction
-    action_laser_only: QtWidgets.QAction
-    
+    action_close: QtGui.QAction
+    action_save: QtGui.QAction
+    action_show_fit_configuration: QtGui.QAction
+    action_start_stop_record: QtGui.QAction
+    action_start_stop_scan: QtGui.QAction
+    action_clear_data: QtGui.QAction
+    action_show_frequency: QtGui.QAction
+    action_autoscale_histogram: QtGui.QAction
+    action_show_histogram_region: QtGui.QAction
+    action_restore_view: QtGui.QAction
+    action_laser_only: QtGui.QAction
+
     def __init__(self):
         super().__init__()
 
-        # Create QActions
-        self.action_close = QtWidgets.QAction('Close')
-        self.action_save = QtWidgets.QAction('Save')
-        self.action_show_fit_configuration = QtWidgets.QAction('Fit Configuration')
-        self.action_start_stop_record = QtWidgets.QAction('Start/Stop Laser Recording')
-        self.action_start_stop_scan = QtWidgets.QAction('Start/Stop Laser Scanning')
-        self.action_clear_data = QtWidgets.QAction('Clear trace data')
-        self.action_show_frequency = QtWidgets.QAction('Frequency Mode')
-        self.action_autoscale_histogram = QtWidgets.QAction('Autoscale histogram')
-        self.action_show_histogram_region = QtWidgets.QAction('Show histogram region')
-        self.action_restore_view = QtWidgets.QAction('Restore default')
-        self.action_laser_only = QtWidgets.QAction('Laser-Only Mode')
+        # Create QActions (QAction is in QtGui in PySide6, not QtWidgets)
+        self.action_close = QtGui.QAction('Close')
+        self.action_save = QtGui.QAction('Save')
+        self.action_show_fit_configuration = QtGui.QAction('Fit Configuration')
+        self.action_start_stop_record = QtGui.QAction('Start/Stop Laser Recording')
+        self.action_start_stop_scan = QtGui.QAction('Start/Stop Laser Scanning')
+        self.action_clear_data = QtGui.QAction('Clear trace data')
+        self.action_show_frequency = QtGui.QAction('Frequency Mode')
+        self.action_autoscale_histogram = QtGui.QAction('Autoscale histogram')
+        self.action_show_histogram_region = QtGui.QAction('Show histogram region')
+        self.action_restore_view = QtGui.QAction('Restore default')
+        self.action_laser_only = QtGui.QAction('Laser-Only Mode')
+
         # Create and set icons
         icon_path = os.path.join(get_artwork_dir(), 'icons')
         exit_icon = QtGui.QIcon(os.path.join(icon_path, 'application-exit'))
@@ -68,6 +69,7 @@ class LaserScanningActions:
         record_icon.addFile(os.path.join(icon_path, 'stop-counter'), state=QtGui.QIcon.State.On)
         play_icon = QtGui.QIcon(os.path.join(icon_path, 'start-counter'))
         play_icon.addFile(os.path.join(icon_path, 'stop-counter'), state=QtGui.QIcon.State.On)
+
         self.action_close.setIcon(exit_icon)
         self.action_save.setIcon(save_icon)
         self.action_show_fit_configuration.setIcon(configure_icon)
@@ -75,6 +77,7 @@ class LaserScanningActions:
         self.action_start_stop_scan.setIcon(play_icon)
         self.action_clear_data.setIcon(clear_icon)
         self.action_autoscale_histogram.setIcon(scale_icon)
+
         # Set tooltips
         self.action_close.setToolTip('Close window. Does NOT deactivate module.')
         self.action_save.setToolTip('Save all data')
@@ -93,6 +96,7 @@ class LaserScanningActions:
         self.action_show_histogram_region.setToolTip('Show visual overlay of the histogram span.')
         self.action_restore_view.setToolTip('Restores default view of the window')
         self.action_laser_only.setToolTip('If checked, the measurement will record laser data only')
+
         # Configure checkable flags
         self.action_close.setCheckable(False)
         self.action_save.setCheckable(False)

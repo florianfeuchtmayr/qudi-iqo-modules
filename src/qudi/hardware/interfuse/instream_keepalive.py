@@ -1,4 +1,4 @@
-from PySide2 import QtCore
+from PySide6 import QtCore
 from qudi.core.module import Base
 from qudi.core.configoption import ConfigOption
 from qudi.core.modulemanager import ModuleManager

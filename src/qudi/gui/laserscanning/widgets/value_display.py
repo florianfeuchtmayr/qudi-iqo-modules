@@ -23,7 +23,7 @@ __all__ = ['LaserValueDisplayWidget']
 
 import numpy as np
 from typing import Optional
-from PySide2 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 
 class LaserValueDisplayWidget(QtWidgets.QWidget):

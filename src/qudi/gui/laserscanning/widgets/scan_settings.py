@@ -22,7 +22,7 @@ If not, see <https://www.gnu.org/licenses/>.
 __all__ = ['LaserScanSettingsWidget', 'LaserScanSettingsDialog', 'LaserScanSettingsDockWidget']
 
 from typing import Optional
-from PySide2 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from qudi.util.widgets.scientific_spinbox import ScienDSpinBox
 from qudi.interface.scannable_laser_interface import ScannableLaserConstraints, LaserScanMode

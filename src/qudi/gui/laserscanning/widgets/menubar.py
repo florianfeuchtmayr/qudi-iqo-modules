@@ -22,7 +22,7 @@ If not, see <https://www.gnu.org/licenses/>.
 __all__ = ['LaserScanningMenuBar']
 
 from typing import Optional
-from PySide2 import QtWidgets
+from PySide6 import QtWidgets
 
 from qudi.gui.laserscanning.widgets.actions import LaserScanningActions
 

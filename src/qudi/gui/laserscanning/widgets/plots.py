@@ -23,7 +23,7 @@ __all__ = ['HistogramPlotWidget', 'ScatterPlotWidget', 'ScatterPlotDockWidget']
 
 import numpy as np
 from pyqtgraph import mkPen
-from PySide2 import QtWidgets
+from PySide6 import QtWidgets
 from typing import Optional, Tuple
 
 from qudi.util.colordefs import QudiPalette

@@ -26,7 +26,7 @@ __all__ = ['DataInStreamBuffer', 'DataInStreamDistributionWorker',
 
 import time
 import numpy as np
-from PySide2 import QtCore
+from PySide6 import QtCore
 from uuid import UUID
 from logging import getLogger
 from weakref import WeakKeyDictionary
