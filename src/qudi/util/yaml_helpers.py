@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-This file contains a custom QDockWidget subclass to be used in the ODMR GUI module.
+This module contains yaml representer and constructor functions to serialize custom classes, e.g. for StatusVar saving.
 
 Copyright (c) 2021, the qudi developers. See the AUTHORS.md file at the top-level directory of this
 distribution and on <https://github.com/Ulm-IQO/qudi-iqo-modules/>
@@ -19,22 +19,16 @@ See the GNU Lesser General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with qudi.
 If not, see <https://www.gnu.org/licenses/>.
 """
+from dataclasses import fields
 
-__all__ = ('OdmrFitDockWidget',)
+from qudi.logic.pulsed.sampling_functions import PulseEnvelope
 
-from qudi.util.widgets.advanced_dockwidget import AdvancedDockWidget
-from qudi.util.widgets.fitting import FitWidget
+def dataclass_representer(representer, data):
+    tag = f'!{data.__class__.__name__}'
+    mapping = {f.name: getattr(data, f.name) for f in fields(data)}
+    return representer.represent_mapping(tag, mapping)
 
 
-class OdmrFitDockWidget(AdvancedDockWidget):
-    """
-    """
-
-    def __init__(self, *args, fit_container=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setWindowTitle('ODMR Fit')
-        self.setObjectName("ODMR Fit")
-        self.setFeatures(self.DockWidgetFeature.DockWidgetFloatable | self.DockWidgetFeature.DockWidgetMovable)
-
-        self.fit_widget = FitWidget(fit_container=fit_container)
-        self.setWidget(self.fit_widget)
+def pulse_envelope_constructor(loader, node):
+    data = loader.construct_mapping(node, deep=True)
+    return PulseEnvelope.from_dict(data)

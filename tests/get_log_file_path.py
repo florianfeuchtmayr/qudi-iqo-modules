@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 
 """
-This file contains a custom QDockWidget subclass to be used in the ODMR GUI module.
+This is a utility file to fetch the qudi log path for the workflow
 
 Copyright (c) 2021, the qudi developers. See the AUTHORS.md file at the top-level directory of this
-distribution and on <https://github.com/Ulm-IQO/qudi-iqo-modules/>
+distribution and on <https://github.com/Ulm-IQO/qudi-core/>
 
 This file is part of qudi.
 
@@ -19,22 +19,9 @@ See the GNU Lesser General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with qudi.
 If not, see <https://www.gnu.org/licenses/>.
 """
-
-__all__ = ('OdmrFitDockWidget',)
-
-from qudi.util.widgets.advanced_dockwidget import AdvancedDockWidget
-from qudi.util.widgets.fitting import FitWidget
+import os
+from qudi.util.paths import get_default_log_dir
 
 
-class OdmrFitDockWidget(AdvancedDockWidget):
-    """
-    """
-
-    def __init__(self, *args, fit_container=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setWindowTitle('ODMR Fit')
-        self.setObjectName("ODMR Fit")
-        self.setFeatures(self.DockWidgetFeature.DockWidgetFloatable | self.DockWidgetFeature.DockWidgetMovable)
-
-        self.fit_widget = FitWidget(fit_container=fit_container)
-        self.setWidget(self.fit_widget)
+log_path = os.path.join(get_default_log_dir(), 'qudi.log')
+print(log_path)
