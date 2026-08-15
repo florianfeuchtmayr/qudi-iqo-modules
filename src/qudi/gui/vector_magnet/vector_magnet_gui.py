@@ -20,7 +20,7 @@ If not, see <https://www.gnu.org/licenses/>.
 """
 
 from __future__ import annotations
-from PySide2 import QtWidgets, QtCore
+from PySide6 import QtWidgets, QtCore
 from qudi.core.module import GuiBase
 from qudi.core.connector import Connector
 import math

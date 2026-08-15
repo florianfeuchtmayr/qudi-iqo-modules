@@ -22,7 +22,7 @@ If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 from abc import abstractmethod
 from typing import Dict
-from PySide2 import QtCore
+from PySide6 import QtCore
 from qudi.core.module import Base
 
 

@@ -25,7 +25,7 @@ import math
 import os
 import time
 from typing import Dict, Optional, List
-from PySide2 import QtCore
+from PySide6 import QtCore
 from qudi.core.module import Base
 from qudi.core.configoption import ConfigOption
 from qudi.core.connector import Connector
@@ -112,6 +112,7 @@ class VectorMagnetLogic(Base):
         self._component_limit_T: float = 0.5
         self._current_tolerance_A: float = 0.01
         self._heater_warmup_s: float = 5.0  # default if not supplied by hardware
+        self._heater_cooldown_s: float = 10.0
 
         # Persistent mode
         self._persistent_enabled: bool = False
@@ -467,19 +468,28 @@ class VectorMagnetLogic(Base):
                     pass
 
             if self._persistent_idle_behavior == 'zero_leads':
-                # Optional: zero leads in persistent mode. This won't affect the magnet current.
-                try:
-                    # Use native sweep zero (per-axis) rather than zero-all so we keep GUI/logic simple.
-                    # If you prefer zero-all, you can call hw.sweep_zero(fast=False) instead.
-                    hw.start_axis_sweep('x', 0.0, fast=False)
-                    hw.start_axis_sweep('y', 0.0, fast=False)
-                    hw.start_axis_sweep('z', 0.0, fast=False)
-                    self._log('PERSISTENT_FINALIZATION (heaters off, leads swept to zero)')
-                    self.sigStatusText.emit("Persistent lock: heaters off; leads swept to zero.")
-                except Exception:
-                    # Non-fatal
-                    self._log('PERSISTENT_FINALIZATION error sweeping leads to zero')
-                    self.sigStatusText.emit("Persistent lock: heaters off; sweep-to-zero failed.")
+                # Wait for persistent switch to open after heater OFF, then sweep leads to zero.
+                cooldown_ms = int(round(self._heater_cooldown_s * 1000.0))
+
+                def _sweep_leads_zero_after_cooldown():
+                    try:
+                        hw.start_axis_sweep('x', 0.0, fast=False)
+                        hw.start_axis_sweep('y', 0.0, fast=False)
+                        hw.start_axis_sweep('z', 0.0, fast=False)
+                        self._log(
+                            f'PERSISTENT_FINALIZATION (heaters off, waited {self._heater_cooldown_s:.1f}s, leads swept to zero)')
+                        self.sigStatusText.emit(
+                            f"Persistent lock: heaters off; waited {self._heater_cooldown_s:.0f}s for switch opening; leads swept to zero."
+                        )
+                    except Exception:
+                        self._log('PERSISTENT_FINALIZATION error sweeping leads to zero')
+                        self.sigStatusText.emit("Persistent lock: heaters off; sweep-to-zero failed.")
+
+                self._log(f'PERSISTENT_COOLDOWN_WAIT {self._heater_cooldown_s:.1f}s before lead zero')
+                self.sigStatusText.emit(
+                    f"Persistent lock: heaters off; waiting {self._heater_cooldown_s:.0f}s for switch opening..."
+                )
+                QtCore.QTimer.singleShot(cooldown_ms, _sweep_leads_zero_after_cooldown)
             else:
                 # hold_leads: do nothing to the supply outputs
                 self._log('PERSISTENT_FINALIZATION (heaters off; leads held)')

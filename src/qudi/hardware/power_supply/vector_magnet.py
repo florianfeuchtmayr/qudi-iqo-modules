@@ -25,7 +25,6 @@ import threading
 import re
 import math
 from typing import Dict, Optional, Any
-from PySide2 import QtCore
 from qudi.core.configoption import ConfigOption
 from qudi.util.mutex import Mutex
 from qudi.interface.vector_magnet_interface import VectorMagnetHardwareInterface
