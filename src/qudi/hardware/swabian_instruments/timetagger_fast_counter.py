@@ -109,6 +109,7 @@ class TimeTaggerFastCounter(FastCounterInterface):
 
         self.log.info(f'TimeTagger fast counter ready (network={self._network}, '
                       f'address="{self._address}" if network).')
+        self.load_path = None
 
     def on_deactivate(self):
         """Stop/clear measurement and free the tagger."""
@@ -260,18 +261,18 @@ class TimeTaggerFastCounter(FastCounterInterface):
 
     def is_gated(self):
         """This counter is used in gated/pulsed mode."""
-        return True
+        return False
 
     def get_data_trace(self):
         """
         Return histogram data for all gates as int64 array and info dict:
             shape = [n_histograms, n_bins]
         """
-        info = {'elapsed_sweeps': None, 'elapsed_time': None}
-        if self._pulsed is None:
-            return np.zeros((self._number_of_gates, 1), dtype='int64'), info
-        data = self._pulsed.getData()
-        return np.array(data, dtype='int64'), info
+        info_dict = {'elapsed_sweeps': None, 'elapsed_time': None}
+        if self.load_path is not None:
+            return np.genfromtxt(self.load_path), info_dict
+        else:
+            return np.array(self._pulsed.getData(), dtype='int64')[0], info_dict
 
     def get_status(self):
         """0=unconfigured, 1=idle, 2=running, 3=paused, -1=error."""
