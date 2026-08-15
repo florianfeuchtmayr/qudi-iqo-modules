@@ -23,7 +23,7 @@ If not, see <https://www.gnu.org/licenses/>.
 
 __all__ = ['threaded_exception_watchdog']
 
-from PySide2 import QtCore
+from PySide6 import QtCore
 from logging import Logger
 from contextlib import contextmanager
 

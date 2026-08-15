@@ -25,7 +25,7 @@ If not, see <https://www.gnu.org/licenses/>.
 import time
 from typing import Optional, List, Set, TYPE_CHECKING, Dict
 from ctypes import byref, cast, c_double, c_int, c_char_p, c_long, POINTER, WINFUNCTYPE, WinDLL
-from PySide2.QtCore import QObject
+from PySide6.QtCore import QObject
 from qudi.core.threadmanager import ThreadManager
 from qudi.core.logger import get_logger
 from qudi.core.module import Base
@@ -36,7 +36,6 @@ import qudi.hardware.wavemeter.high_finesse_constants as high_finesse_constants
 from qudi.hardware.wavemeter.high_finesse_wrapper import load_dll, setup_dll, MIN_VERSION
 if TYPE_CHECKING:
     from qudi.hardware.wavemeter.high_finesse_wavemeter import HighFinesseWavemeter
-
 
 THREAD_NAME_WATCHDOG = 'wavemeter_callback_error_watchdog'
 
@@ -62,10 +61,11 @@ class Watchdog(QObject):
         self._stop = True
 
     def check_for_channel_activation_change(self) -> None:
-        actual_active_channels = set(self._proxy.get_active_channels())
-        if self._proxy.get_connected_channels() != actual_active_channels:
-            self.log.warning('Channel was deactivated or activated through GUI.')
-            self._proxy.stop_everything()
+        """
+        Do not force-stop or reconfigure when the HF GUI changes channel activation.
+        We keep streaming and simply reflect whatever channels produce data.
+        """
+        return
 
     def handle_error(self) -> None:
         self.log.warning('Error in callback function.')
@@ -146,17 +146,14 @@ class HighFinesseProxy(Base):
     def connect_instreamer(self, module: 'HighFinesseWavemeter', channels: List[int]):
         """
         Connect an instreamer module to the proxy.
-        The proxy will start to put new samples into the instreamer buffer.
+        Do NOT toggle switch channels here. The HF GUI is the source of truth.
         """
         if module not in self._connected_instream_modules:
             with self._lock:
-                # do channel activation in a lock to prevent the watchdog from stopping things
-                not_connected_yet = set(channels) - self.get_connected_channels()
-                for ch in not_connected_yet:
-                    self._activate_channel(ch)
+                # Track channels the client will receive (for filtering callbacks only)
                 self._connected_instream_modules[module] = set(channels)
             if self._callback_function is None:
-                self._activate_only_connected_channels()
+                # Start measurement/callback without touching channel activation
                 self._start_measurement()
                 self._start_callback()
         else:
@@ -239,7 +236,7 @@ class HighFinesseProxy(Base):
             streamer.stop_stream_watchdog()
 
     # --- PID related methods ---
-    
+
     def get_pid_setting(self, output_port: int, cmi_val: int):
         """
         Generic method to get PID values and settings
@@ -304,7 +301,7 @@ class HighFinesseProxy(Base):
         @return (bool): True if PID is enabled, False otherwise
         """
         return self._wavemeter_dll.GetDeviationMode(False)
-    
+
     def set_pid_enabled(self, enabled: bool):
         """ Set the PID status """
         err = self._wavemeter_dll.SetDeviationMode(enabled)
@@ -312,7 +309,7 @@ class HighFinesseProxy(Base):
             raise RuntimeError(f'Error while setting PID enabled: {high_finesse_constants.ResultError(err)}')
 
     def get_laser_control_setting(self, output_port: int, cmi_val: int):
-        """ 
+        """
         Generic method to get laser control settings
         @return: laser control setting
         """
@@ -324,7 +321,7 @@ class HighFinesseProxy(Base):
             return d_val.value, i_val.value, pidc.value
         else:
             raise RuntimeError(f'Error while getting laser control setting: {high_finesse_constants.ResultError(err)}')
-    
+
     def get_control_value(self, output_port: int):
         """
         Get the control value for a specific voltage output port

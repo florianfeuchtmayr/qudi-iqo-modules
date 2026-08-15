@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+If you prefer to design with Qt Designer, replace this file with a rich layout.
+The controller currently loads a programmatic layout; this .ui is a placeholder
+so that the file exists in the same folder. You can later bind objectNames to
+the ones referenced in vector_magnet_gui.py for a designer-based layout.
+-->
+<ui version="4.0">
+ <class>VectorMagnetPlaceholder</class>
+ <widget class="QWidget" name="VectorMagnetPlaceholder">
+  <property name="windowTitle">
+   <string>Vector Magnet (Placeholder)</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <widget class="QLabel" name="labelInfo">
+     <property name="text">
+      <string>Vector Magnet GUI placeholder - programmatic layout used instead.</string>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

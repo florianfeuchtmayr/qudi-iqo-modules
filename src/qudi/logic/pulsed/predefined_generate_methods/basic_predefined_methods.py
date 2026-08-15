@@ -981,6 +981,98 @@ class BasicPredefinedGenerator(PredefinedGeneratorBase):
         created_ensembles.append(block_ensemble)
         return created_blocks, created_ensembles, created_sequences
 
+
+    def generate_t1_timetagger(self, name='t1_timetagger',
+                               tau_start=1.0e-6,
+                               tau_step=1.0e-6,
+                               num_of_points=50,
+                               use_init_laser=True):
+        """
+        T1 using OkFpgaPulser + TimeTagger:
+        - (optional) init laser to polarize
+        - wait tau (swept)
+        - short TTL on sync_channel (wired to TimeTagger 'detect')
+        - optional trigger_delay
+        - readout laser gate (counting window)
+
+        TimeTaggerFastCounter should be configured with:
+          click_channel = APD (or APD0+APD1 combined)
+          start_channel = detect (sync TTL)
+          next_channel = detect (one histogram per readout)
+        """
+        created_blocks = []
+        created_ensembles = []
+        created_sequences = []
+
+        # Short trigger pulse; keep consistent with other generators in this file
+        trigger_width = 20e-9
+        trig_delay = float(getattr(self, 'trigger_delay', 0.0) or 0.0)
+
+        # Pick a trigger helper that exists on this generator
+        trig_helper = getattr(self, '_get_trigger_element_inverted', None)
+        if trig_helper is None:
+            trig_helper = self._get_trigger_element
+
+        # Build elements
+        trigger_elem = trig_helper(
+            length=trigger_width,
+            channels=[self.sync_channel],  # set in sequence_generator_logic.options.sync_channel
+            increment=0
+        )
+        idle = lambda L: self._get_idle_element(length=L, increment=0)
+
+        t1_block = PulseBlock(name=name)
+
+        # (1) Optional init laser (ignored via metadata)
+        if use_init_laser:
+            init_laser = self._get_laser_gate_element(length=self.laser_length, increment=0)
+            t1_block.append(init_laser)
+
+        # (2) Tau (swept)
+        tau_elem = self._get_idle_element(length=tau_start, increment=tau_step)
+        t1_block.append(tau_elem)
+
+        # (3) Trigger for TimeTagger 'detect'
+        t1_block.append(trigger_elem)
+
+        # (4) Optional delay to align trigger->readout
+        if trig_delay > 0:
+            t1_block.append(idle(trig_delay))
+
+        # (5) Readout laser gate
+        readout_laser = self._get_laser_gate_element(length=self.laser_length, increment=0)
+        t1_block.append(readout_laser)
+
+        # (6) Optional dead-time after readout
+        if getattr(self, 'laser_delay', 0.0) > 0:
+            t1_block.append(idle(self.laser_delay))
+
+        # (7) Optional wait between repetitions
+        if getattr(self, 'wait_time', 0.0) > 0:
+            t1_block.append(idle(self.wait_time))
+
+        created_blocks.append(t1_block)
+
+        # Repeat the block while sweeping tau via the increment set above
+        ens = PulseBlockEnsemble(name=name, rotating_frame=False)
+        ens.append((t1_block.name, num_of_points - 1))
+        created_ensembles.append(ens)
+
+        # Metadata for PulsedMeasurementLogic
+        tau_array = tau_start + np.arange(num_of_points) * tau_step
+        laser_ignore = [0] if use_init_laser else []
+
+        ens.measurement_information['alternating'] = False
+        ens.measurement_information['laser_ignore_list'] = laser_ignore
+        ens.measurement_information['controlled_variable'] = tau_array
+        ens.measurement_information['units'] = ('s', '')
+        ens.measurement_information['labels'] = ('Tau', 'Signal')
+        ens.measurement_information['number_of_lasers'] = (2 * num_of_points) if use_init_laser else num_of_points
+        ens.measurement_information['counting_length'] = self._get_ensemble_count_length(
+            ensemble=ens, created_blocks=created_blocks)
+
+        return created_blocks, created_ensembles, created_sequences
+
     def generate_HHamp(self, name='hh_amp', spinlock_length=20e-6, amp_start=0.05, amp_step=0.01,
                        num_of_points=50):
         """
@@ -1569,19 +1661,15 @@ class BasicPredefinedGenerator(PredefinedGeneratorBase):
         # Create the PulseSequence and append the PulseBlockEnsemble names as sequence steps
         # together with the necessary parameters.
         t1_sequence = PulseSequence(name=name, rotating_frame=False)
-        count_length = 0.0
         for k in k_array:
             t1_sequence.append(tau_ensemble.name)
             t1_sequence[-1].repetitions = int(k) - 1
-            count_length += k * self._get_ensemble_count_length(ensemble=tau_ensemble,
-                                                                created_blocks=created_blocks)
 
             if self.sync_channel and k == k_array[-1]:
                 t1_sequence.append(sync_readout_ensemble.name)
             else:
                 t1_sequence.append(readout_ensemble.name)
-            count_length += self._get_ensemble_count_length(ensemble=readout_ensemble,
-                                                            created_blocks=created_blocks)
+
         # Make the sequence loop infinitely by setting the go_to parameter of the last sequence
         # step to the first step.
         t1_sequence[-1].go_to = 1
@@ -1596,7 +1684,7 @@ class BasicPredefinedGenerator(PredefinedGeneratorBase):
         t1_sequence.measurement_information['units'] = ('s', '')
         t1_sequence.measurement_information['labels'] = ('Tau<sub>pulse spacing</sub>', 'Signal')
         t1_sequence.measurement_information['number_of_lasers'] = len(tau_array)
-        t1_sequence.measurement_information['counting_length'] = count_length
+        t1_sequence.measurement_information['counting_length'] = self._get_sequence_count_length(t1_sequence, created_ensembles, created_blocks)
 
         # Append PulseSequence to created_sequences list
         created_sequences.append(t1_sequence)

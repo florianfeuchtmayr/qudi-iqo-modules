@@ -27,7 +27,7 @@ __all__ = ['LaserScanningLogic']
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-from PySide2 import QtCore
+from PySide6 import QtCore
 from dataclasses import dataclass
 from datetime import datetime
 from lmfit.model import ModelResult as _ModelResult

@@ -236,3 +236,109 @@ class BasicPulseAnalyzer(PulseAnalyzerBase):
             error_data[ii] = signal_data[ii] * np.sqrt(1 / abs(signal_sum) + 1 / abs(reference_sum))
 
         return signal_data, error_data
+
+    def analyse_fidelity(self, laser_data):
+        def fit_exponential(laser_data, bin_width):
+            """
+            This method takes the mean of the signal window.
+            It then does not divide by the background window to normalize
+            but rather substracts the background window to generate the output.
+
+            Furthermore it references every signal to the 2nd laser pulse, which is optically repumped according
+            to reference https://journals.aps.org/prx/supplemental/10.1103/PhysRevX.12.011056/supplementary_final.pdf
+            Section II..
+
+            @param 2D numpy.ndarray laser_data: the raw timetrace data from a gated fast counter
+                                                dim 0: gate number; dim 1: time bin
+            @param float signal_start: Beginning of the signal window in s
+            @param float signal_end: End of the signal window in s
+            @param float norm_start: Beginning of the background window in s
+            @param float norm_end: End of the background window in s
+
+            @return numpy.ndarray, numpy.ndarray: analyzed data per laser pulse, error per laser pulse
+            """
+            # Get number of lasers
+            laser_fit = np.zeros_like(laser_data)
+            num_of_lasers = laser_data.shape[0]
+
+            if not isinstance(bin_width, float):
+                return np.zeros(num_of_lasers), np.zeros(num_of_lasers)
+
+            ts = np.arange(laser_data.shape[1]) * bin_width
+
+            As = np.zeros(num_of_lasers, dtype=float)
+            err_As = np.zeros(num_of_lasers, dtype=float)
+            Tpumps = np.zeros(num_of_lasers, dtype=float)
+            err_Tpumps = np.zeros(num_of_lasers, dtype=float)
+            cs = np.zeros(num_of_lasers, dtype=float)
+            err_cs = np.zeros(num_of_lasers, dtype=float)
+
+            popt = np.zeros(3)
+            pcov = np.zeros((3, 3))
+            for ii, laser_arr in enumerate(laser_data):
+                if not popt.any():
+                    try:
+                        popt, pcov = cf(exponential, ts, laser_arr,
+                                        p0=[np.amax(laser_arr), 10e-6, np.mean(laser_arr)],
+                                        bounds=[
+                                            [0, bin_width, 0],
+                                            [max(2 * np.amax(laser_data), 1), max(ts), max(2 * np.amax(laser_data), 1)]
+                                        ],
+                                        maxfev=500)
+                    except RuntimeError:
+                        popt = np.zeros(3)
+                        pcov = np.zeros((3, 3))
+                    except ValueError:
+                        print(popt)
+                else:
+                    try:
+                        popt, pcov = cf(exponential, ts, laser_arr,
+                                        p0=popt,
+                                        bounds=[
+                                            [0, bin_width, 0],
+                                            [max(2 * np.amax(laser_data), 1), max(ts), max(2 * np.amax(laser_data), 1)]
+                                        ],
+                                        maxfev=500)
+                    except RuntimeError:
+                        popt = np.zeros(3)
+                        pcov = np.zeros((3, 3))
+                    except ValueError:
+                        print("Value Error: ")
+                        print(popt)
+                        print([0, bin_width, 0])
+                        print([max(2 * np.amax(laser_arr), 1), max(ts), max(2 * np.amax(laser_arr), 1)])
+
+                laser_fit[ii] = exponential(ts, *popt)
+                As[ii] = popt[0]
+                Tpumps[ii] = popt[1]
+                cs[ii] = popt[2]
+                err_As[ii] = np.sqrt(np.diag(pcov)[0])
+                err_Tpumps[ii] = np.sqrt(np.diag(pcov)[1])
+                err_cs[ii] = np.sqrt(np.diag(pcov)[2])
+
+            return laser_fit, As, err_As, Tpumps, err_Tpumps, cs, err_cs
+
+        def exponential(x, A, T, c):
+            return A * np.exp(-x / T) + c
+
+        def fidelity(As, cs, err_As, err_cs, ref_idx=None):
+            if not ref_idx:
+                ref_idx = np.argmax(As)
+            F = As/(As+cs)
+            err_F = np.sqrt((cs/(As+cs)**2*err_As)**2 + (As/(As+cs)**2*err_cs)**2)
+            # return F, err_F
+            F_max = F[ref_idx]
+            F_ref = F/F_max
+            err_F_ref = np.sqrt((1/F[ref_idx]*err_F)**2 + (F/F[ref_idx]**2*err_F)**2)
+            #
+            As_scaled = (-1 + 2*F_max)*As/As[ref_idx] + (1-F_max)
+            err_As_scaled = np.sqrt( ( (2*As/As[ref_idx]-1) * err_F_ref)**2 + ((1-2*F_max)/As[ref_idx]*err_As)**2 + ((1-2*F_max)*As/As[ref_idx]**2*err_As[ref_idx])**2 )
+
+            return As_scaled, err_As_scaled
+
+        laser_fit, As, err_As, Tpumps, err_Tpumps, cs, err_cs = fit_exponential(laser_data,
+                                                                                self.fast_counter_settings['bin_width'])
+        # self.params = np.array([As, err_As, Tpumps, err_Tpumps, cs, err_cs])
+        self._PulseAnalyzerBase__pulsedmeasurementlogic.laser_fit = laser_fit
+        self._PulseAnalyzerBase__pulsedmeasurementlogic.laser_fit_params = [As, err_As, Tpumps, err_Tpumps, cs, err_cs]
+        return fidelity(As, cs, err_As, err_cs)

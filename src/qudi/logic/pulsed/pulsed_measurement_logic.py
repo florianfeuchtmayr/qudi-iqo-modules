@@ -20,11 +20,12 @@ If not, see <https://www.gnu.org/licenses/>.
 """
 import os.path
 
-from PySide2 import QtCore
+from PySide6 import QtCore
 import numpy as np
 import time
 import datetime
 import matplotlib.pyplot as plt
+import math
 
 from qudi.core.connector import Connector
 from qudi.core.configoption import ConfigOption
@@ -39,6 +40,10 @@ from qudi.util.units import ScaledFloat
 from qudi.util.colordefs import QudiMatplotlibStyle
 from qudi.logic.pulsed.pulse_extractor import PulseExtractor
 from qudi.logic.pulsed.pulse_analyzer import PulseAnalyzer
+
+from qudi.interface.pulser_interface import PulserInterface
+from qudi.interface.fast_counter_interface import FastCounterInterface
+from qudi.interface.microwave_interface import MicrowaveInterface
 
 
 def _data_storage_from_cfg_option(cfg_str):
@@ -70,9 +75,9 @@ class PulsedMeasurementLogic(LogicBase):
     """
 
     # declare connectors
-    _fastcounter = Connector(name='fastcounter', interface='FastCounterInterface')
-    _pulsegenerator = Connector(name='pulsegenerator', interface='PulserInterface')
-    _microwave = Connector(name='microwave', interface='MicrowaveInterface', optional=True)
+    _fastcounter = Connector(name='fastcounter', interface=FastCounterInterface)
+    _pulsegenerator = Connector(name='pulsegenerator', interface=PulserInterface)
+    _microwave = Connector(name='microwave', interface=MicrowaveInterface, optional=True)
 
     # Config options
     # Optional additional paths to import from
@@ -260,7 +265,7 @@ class PulsedMeasurementLogic(LogicBase):
         self.__analysis_timer.setSingleShot(False)
         self.__analysis_timer.setInterval(round(1000. * self.__timer_interval))
         self.__analysis_timer.timeout.connect(self._pulsed_analysis_loop,
-                                              QtCore.Qt.QueuedConnection)
+                                              QtCore.Qt.ConnectionType.QueuedConnection)
 
         # Fitting
         self.fit_config_model = FitConfigurationsModel(parent=self)
@@ -297,8 +302,8 @@ class PulsedMeasurementLogic(LogicBase):
         self._recalled_raw_data_tag = None
 
         # Connect internal signals
-        self.sigStartTimer.connect(self.__analysis_timer.start, QtCore.Qt.QueuedConnection)
-        self.sigStopTimer.connect(self.__analysis_timer.stop, QtCore.Qt.QueuedConnection)
+        self.sigStartTimer.connect(self.__analysis_timer.start, QtCore.Qt.ConnectionType.QueuedConnection)
+        self.sigStopTimer.connect(self.__analysis_timer.stop, QtCore.Qt.ConnectionType.QueuedConnection)
         return
 
     def on_deactivate(self):
@@ -1364,7 +1369,8 @@ class PulsedMeasurementLogic(LogicBase):
 
     ############################################################################
     def _get_raw_metadata(self):
-        return {'bin width (s)'               : self.__fast_counter_binwidth,
+
+        meta = {'bin width (s)'               : self.__fast_counter_binwidth,
                 'record length (s)'           : self.__fast_counter_record_length,
                 'gated counting'              : self.fast_counter_settings['is_gated'],
                 'Number of laser pulses'      : self._number_of_lasers,
@@ -1372,6 +1378,115 @@ class PulsedMeasurementLogic(LogicBase):
                 'Controlled variable'         : list(self.signal_data[0]),
                 'Approx. measurement time (s)': self.__elapsed_time,
                 'Measurement sweeps'          : self.__elapsed_sweeps}
+        # Take a safe snapshot of module instances and states
+        mm = self._qudi_main.module_manager
+        instances = mm.module_instances  # dict: {name: instance}
+        states = mm.module_states  # dict: {name: 'deactivated'|'idle'|'locked'}
+
+        # Powermeter (ProcessValueInterface)
+        try:
+            pm = instances.get('powermeter')
+            if pm and states.get('powermeter') != 'deactivated':
+                # Ensure channel active if needed (TLPM)
+                try:
+                    if hasattr(pm, 'get_activity_state') and not pm.get_activity_state('Power'):
+                        pm.set_activity_state('Power', True)
+                except Exception:
+                    pass
+                meta['Laser Power (W)'] = float(pm.get_process_value('Power'))
+            else:
+                meta['Laser Power (W)'] = float('nan')
+        except Exception:
+            meta['Laser Power (W)'] = float('nan')
+
+        # Wavemeter buffer (DataInStreamInterface)
+        try:
+            wm = instances.get('wavemeter_ni_sync_interfuse')
+            if wm and states.get('wavemeter_ni_sync_interfuse') != 'deactivated':
+                started_here = False
+                try:
+                    st = wm.module_state()
+                except Exception:
+                    st = states.get('wavemeter_ni_sync_interfuse', 'deactivated')
+
+                if st == 'idle':
+                    # Start a short stream to get a single point
+                    wm.start_stream()
+                    started_here = True
+
+                # Wait a short moment for one sample to appear
+                t0 = time.time()
+                while getattr(wm, 'available_samples', 0) < 1 and (time.time() - t0) < 0.5:
+                    time.sleep(0.01)
+
+                data, ts = wm.read_single_point()  # returns (data, timestamp)
+                chs = list(getattr(wm, 'active_channels', []))
+                meta['Wavemeter Channels'] = chs
+                # Guard against length mismatch on some remotes
+                n = min(len(chs), len(data))
+                meta['Wavemeter Values'] = [float(netobtain(data[i])) for i in range(n)]
+                meta['Wavemeter Timestamp (s)'] = None if ts is None else float(netobtain(ts))
+
+                if started_here:
+                    wm.stop_stream()
+            else:
+                meta['Wavemeter Channels'] = []
+                meta['Wavemeter Values'] = []
+                meta['Wavemeter Timestamp (s)'] = None
+        except Exception:
+            meta['Wavemeter Channels'] = []
+            meta['Wavemeter Values'] = []
+            meta['Wavemeter Timestamp (s)'] = None
+
+        # Vector magnet (currents A and derived field in T + spherical)
+        try:
+            vm = instances.get('vector_magnet')
+            if vm and states.get('vector_magnet') != 'deactivated':
+                ix = float(vm.get_axis_magnet_current('x', fresh=True))
+                iy = float(vm.get_axis_magnet_current('y', fresh=True))
+                iz = float(vm.get_axis_magnet_current('z', fresh=True))
+                meta['Magnet Currents (A)'] = {'x': ix, 'y': iy, 'z': iz}
+
+                # Field (Tesla) from diagonal calibration in hardware
+                cal = getattr(vm, '_cal_diag', {'x': float('nan'), 'y': float('nan'), 'z': float('nan')})
+                bx = ix * float(cal.get('x', float('nan')))
+                by = iy * float(cal.get('y', float('nan')))
+                bz = iz * float(cal.get('z', float('nan')))
+                bmag = math.sqrt(bx * bx + by * by + bz * bz) if all(
+                    math.isfinite(v) for v in (bx, by, bz)) else float('nan')
+
+                # Spherical (same convention as VectorMagnetLogic):
+                # request_set_field_spherical used theta_conv = pi - theta_user; Bz = B*cos(theta_conv) = -B*cos(theta_user)
+                # => cos(theta_user) = -Bz/B; phi = atan2(By, Bx)
+                if math.isfinite(bmag) and bmag > 0.0:
+                    # clamp for numerical safety
+                    c = max(-1.0, min(1.0, -bz / bmag))
+                    theta_user_deg = math.degrees(math.acos(c))
+                    phi_deg = (math.degrees(math.atan2(by, bx)) + 360.0) % 360.0
+                else:
+                    theta_user_deg = float('nan')
+                    phi_deg = float('nan')
+
+                meta['Magnetic Field (T)'] = {'Bx': bx, 'By': by, 'Bz': bz, 'Bmag': bmag}
+                meta['Magnetic Field (spherical)'] = {
+                    'Bmag_T': bmag,
+                    'theta_user_deg': theta_user_deg,
+                    'phi_deg': phi_deg
+                }
+            else:
+                meta['Magnet Currents (A)'] = {'x': float('nan'), 'y': float('nan'), 'z': float('nan')}
+                meta['Magnetic Field (T)'] = {'Bx': float('nan'), 'By': float('nan'), 'Bz': float('nan'),
+                                              'Bmag': float('nan')}
+                meta['Magnetic Field (spherical)'] = {'Bmag_T': float('nan'), 'theta_user_deg': float('nan'),
+                                                      'phi_deg': float('nan')}
+        except Exception:
+            meta['Magnet Currents (A)'] = {'x': float('nan'), 'y': float('nan'), 'z': float('nan')}
+            meta['Magnetic Field (T)'] = {'Bx': float('nan'), 'By': float('nan'), 'Bz': float('nan'),
+                                          'Bmag': float('nan')}
+            meta['Magnetic Field (spherical)'] = {'Bmag_T': float('nan'), 'theta_user_deg': float('nan'),
+                                                  'phi_deg': float('nan')}
+
+        return meta
 
     def _get_laser_metadata(self):
         return {'bin width (s)'        : self.__fast_counter_binwidth,
@@ -1464,6 +1579,8 @@ class PulsedMeasurementLogic(LogicBase):
         # get and initialize data storage object. Daily sub-directory behaviour is already
         # included in self.module_default_data_dir.
         data_storage = storage_cls(root_dir=data_dir)
+        raw_metadata = self._get_raw_metadata()
+        signal_metadata = self._get_signal_metadata()
 
         ###############
         # Save raw data
@@ -1475,7 +1592,7 @@ class PulsedMeasurementLogic(LogicBase):
         # Save data to file
         data_storage.save_data(
             self.raw_data.astype('int64')[:, np.newaxis] if self.raw_data.ndim == 1 else self.raw_data.astype('int64'),
-            metadata=self._get_raw_metadata(),
+            metadata=raw_metadata,
             nametag=nametag,
             filename=save_filename,
             timestamp=timestamp,
@@ -1514,7 +1631,7 @@ class PulsedMeasurementLogic(LogicBase):
 
             save_path, _, _ = data_storage.save_data(
                 data,
-                metadata=self._get_signal_metadata(),
+                metadata=signal_metadata,
                 nametag=nametag,
                 filename=save_filename,
                 timestamp=timestamp,
@@ -1524,11 +1641,14 @@ class PulsedMeasurementLogic(LogicBase):
 
             # save thumbnail figure if required
             if save_figure:
-                fig = self._plot_pulsed_thumbnail(with_error=with_error)
+                fig = self._plot_pulsed_thumbnail(with_error=with_error, raw_metadata = raw_metadata, signal_metadata = signal_metadata)
                 fig_path = save_path.rsplit('.', 1)[0]
                 data_storage.save_thumbnail(fig, file_path=fig_path)
 
-    def _plot_pulsed_thumbnail(self, with_error=False):
+    def _plot_pulsed_thumbnail(self, with_error=False, raw_metadata = None, signal_metadata = None):
+
+        raw_metadata = raw_metadata or {}
+        signal_metadata = signal_metadata or {}
 
         def _plot_fit(axis, use_alternative_data=False):
 
@@ -1618,27 +1738,48 @@ class PulsedMeasurementLogic(LogicBase):
 
             return text_str
 
-        # Prepare the figure to save as a "data thumbnail"
+        # Prepare the figure and colors (unchanged)
         plt.style.use(QudiMatplotlibStyle.style)
-
-        # extract the possible colors from the colorscheme:
-        # todo: still needed or set by core?
         prop_cycle = QudiMatplotlibStyle.style['axes.prop_cycle']
-        colors = {}
-        for i, color_setting in enumerate(prop_cycle):
-            colors[i] = color_setting['color']
+        colors = {i: c['color'] for i, c in enumerate(prop_cycle)}
 
-        # scale the x_axis for plotting
-        max_val = np.max(self.signal_data[0])
+        # Build metadata lines to show in left panel
+        meta_lines = self._thumbnail_metadata_lines(raw_metadata, signal_metadata)
+
+        # Layout: add a narrow left column for meta text, plots on the right
+        has_alt = bool(self._alternative_data_type and self._alternative_data_type != 'None')
+
+        if has_alt:
+            fig = plt.figure()
+            gs = fig.add_gridspec(nrows=2, ncols=2, width_ratios=[0.52, 1.0], wspace=0.15, hspace=0.30)
+            ax_meta = fig.add_subplot(gs[:, 0])
+            ax1 = fig.add_subplot(gs[0, 1])
+            ax2 = fig.add_subplot(gs[1, 1])
+        else:
+            fig = plt.figure()
+            gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[0.52, 1.0], wspace=0.15)
+            ax_meta = fig.add_subplot(gs[0, 0])
+            ax1 = fig.add_subplot(gs[0, 1])
+            ax2 = None
+
+        # Left metadata panel rendering  # CHANGED (use same font as plots)
+        ax_meta.axis('off')
+        y = 0.98
+        # pick font size from style (fallback to 10)
+        meta_fontsize = QudiMatplotlibStyle.style.get('font.size', 10)  # CHANGED
+        line_h = 0.07 if len(meta_lines) <= 10 else max(0.04, 0.9 / max(1, len(meta_lines)))
+        for ln in meta_lines:
+            ax_meta.text(0.02, y, ln, transform=ax_meta.transAxes,
+                         fontsize=meta_fontsize,  # CHANGED
+                         va='top', ha='left')
+            y -= line_h
+
+        # Now proceed with the existing plotting logic, but use ax1 (and ax2 if present) instead of creating new axes
+        # Scale x-axis and plot main trace
+        max_val = np.max(self.signal_data[0]) if len(self.signal_data[0]) else 1.0
         scaled_float = ScaledFloat(max_val)
         counts_prefix = scaled_float.scale
         x_axis_scaled = self.signal_data[0] / scaled_float.scale_val
-
-        # Create the figure object
-        if self._alternative_data_type and self._alternative_data_type != 'None':
-            fig, (ax1, ax2) = plt.subplots(2, 1)
-        else:
-            fig, ax1 = plt.subplots()
 
         if with_error:
             ax1.errorbar(x=x_axis_scaled, y=self.signal_data[1],
@@ -1646,18 +1787,16 @@ class PulsedMeasurementLogic(LogicBase):
                          linestyle=':', linewidth=0.5, color=colors[0],
                          ecolor=colors[1], capsize=3, capthick=0.9,
                          elinewidth=1.2, label='data trace 1')
-
-            if self._alternating:
+            if self._alternating and self.signal_data.shape[0] > 2:
                 ax1.errorbar(x=x_axis_scaled, y=self.signal_data[2],
                              yerr=self.measurement_error[2], fmt='-D',
                              linestyle=':', linewidth=0.5, color=colors[3],
-                             ecolor=colors[4],  capsize=3, capthick=0.7,
+                             ecolor=colors[4], capsize=3, capthick=0.7,
                              elinewidth=1.2, label='data trace 2')
         else:
             ax1.plot(x_axis_scaled, self.signal_data[1], color=colors[0],
                      linestyle=':', linewidth=0.5, label='data trace 1')
-
-            if self._alternating:
+            if self._alternating and self.signal_data.shape[0] > 2:
                 ax1.plot(x_axis_scaled, self.signal_data[2], '-o',
                          color=colors[3], linestyle=':', linewidth=0.5,
                          label='data trace 2')
@@ -1665,39 +1804,29 @@ class PulsedMeasurementLogic(LogicBase):
         if _is_fit_available():
             _plot_fit(axis=ax1)
 
-        # handle the save of the alternative data plot
-        if self._alternative_data_type and self._alternative_data_type != 'None':
+        # Optional secondary (FFT/Delta etc.)
+        if has_alt and ax2 is not None:
+            max_val = np.max(self.signal_alt_data[0]) if len(self.signal_alt_data[0]) else 1.0
+            scaled_float_alt = ScaledFloat(max_val)
+            x_axis_prefix = scaled_float_alt.scale
+            x_axis_ft_scaled = self.signal_alt_data[0] / scaled_float_alt.scale_val
 
-            # scale the x_axis for plotting
-            max_val = np.max(self.signal_alt_data[0])
-            scaled_float = ScaledFloat(max_val)
-            x_axis_prefix = scaled_float.scale
-            x_axis_ft_scaled = self.signal_alt_data[0] / scaled_float.scale_val
-
-            # since no ft units are provided, make a small work around:
             if self._alternative_data_type == 'FFT':
                 if self._data_units[0] == 's':
                     inverse_cont_var = 'Hz'
                 elif self._data_units[0] == 'Hz':
                     inverse_cont_var = 's'
                 else:
-                    inverse_cont_var = '(1/{0})'.format(self._data_units[0])
-                x_axis_ft_label = 'FT {0} ({1}{2})'.format(
-                    self._data_labels[0], x_axis_prefix, inverse_cont_var)
-                y_axis_ft_label = 'FT({0}) (arb. u.)'.format(self._data_labels[1])
+                    inverse_cont_var = f'(1/{self._data_units[0]})'
+                x_axis_ft_label = f'FT {self._data_labels[0]} ({x_axis_prefix}{inverse_cont_var})'
+                y_axis_ft_label = f'FT({self._data_labels[1]}) (arb. u.)'
                 ft_label = 'FT of data trace 1'
             else:
-                if self._data_units[0]:
-                    x_axis_ft_label = '{0} ({1}{2})'.format(self._data_labels[0], x_axis_prefix,
-                                                            self._data_units[0])
-                else:
-                    x_axis_ft_label = '{0}'.format(self._data_labels[0])
-                if self._data_units[1]:
-                    y_axis_ft_label = '{0} ({1})'.format(self._data_labels[1], self._data_units[1])
-                else:
-                    y_axis_ft_label = '{0}'.format(self._data_labels[1])
-
-                ft_label = '{0} of data traces'.format(self._alternative_data_type)
+                x_axis_ft_label = f'{self._data_labels[0]} ({x_axis_prefix}{self._data_units[0]})' if \
+                self._data_units[0] else f'{self._data_labels[0]}'
+                y_axis_ft_label = f'{self._data_labels[1]} ({self._data_units[1]})' if self._data_units[
+                    1] else f'{self._data_labels[1]}'
+                ft_label = f'{self._alternative_data_type} of data traces'
 
             ax2.plot(x_axis_ft_scaled, self.signal_alt_data[1],
                      linestyle=':', linewidth=0.5, color=colors[0],
@@ -1709,7 +1838,6 @@ class PulsedMeasurementLogic(LogicBase):
 
             data_ft_label_tex = [_subscript_html_2_tex(x_axis_ft_label),
                                  _subscript_html_2_tex(y_axis_ft_label)]
-
             ax2.set_xlabel(data_ft_label_tex[0])
             ax2.set_ylabel(data_ft_label_tex[1])
             ax2.legend(bbox_to_anchor=(0., 1.02, 1., .102), loc=3, ncol=2,
@@ -1718,22 +1846,18 @@ class PulsedMeasurementLogic(LogicBase):
             if _is_fit_available(use_alternative_data=True):
                 _plot_fit(axis=ax2, use_alternative_data=True)
 
+        # Axes labels and layout
         data_label_tex = [_subscript_html_2_tex(self._data_labels[0]),
                           _subscript_html_2_tex(self._data_labels[1])]
-
-        ax1.set_xlabel(
-            '{0} ({1}{2})'.format(data_label_tex[0], counts_prefix, self._data_units[0]))
+        ax1.set_xlabel(f'{data_label_tex[0]} ({counts_prefix}{self._data_units[0]})')
         if self._data_units[1]:
-            ax1.set_ylabel('{0} ({1})'.format(data_label_tex[1], self._data_units[1]))
+            ax1.set_ylabel(f'{data_label_tex[1]} ({self._data_units[1]})')
         else:
-            ax1.set_ylabel('{0}'.format(data_label_tex[1]))
+            ax1.set_ylabel(f'{data_label_tex[1]}')
 
-        fig.tight_layout()
+        #fig.tight_layout()
         ax1.legend(bbox_to_anchor=(0., 1.02, 1., .102), loc=3, ncol=2,
                    mode="expand", borderaxespad=0.)
-        # plt.legend(bbox_to_anchor=(0., 1.02, 1., .102), loc=3, ncol=2,
-        #            mode="expand", borderaxespad=0.)
-
         return fig
 
     def _compute_alt_data(self):
@@ -1765,3 +1889,70 @@ class PulsedMeasurementLogic(LogicBase):
             self.signal_alt_data = np.zeros(self.signal_data.shape, dtype=float)
             self.signal_alt_data[0] = self.signal_data[0]
         return
+
+    def _thumbnail_metadata_lines(self, raw_metadata: dict, signal_metadata: dict) -> list:
+        """Format a compact list of lines to show at left of the thumbnail."""
+        lines = []
+
+        # Power (use readable unit)
+        pw = raw_metadata.get('Laser Power (W)')
+        if isinstance(pw, (int, float)) and math.isfinite(pw):
+            pval, unit = float(pw), 'W'
+            if pval < 1e-6:
+                pval, unit = pval * 1e9, 'nW'
+            elif pval < 1e-3:
+                pval, unit = pval * 1e6, 'µW'
+            elif pval < 1:
+                pval, unit = pval * 1e3, 'mW'
+            lines.append(f'Power: {pval:.3g} {unit}')
+
+            # Wavemeter – only channels whose name contains 'laser' and value is finite and not zero
+            chs = raw_metadata.get('Wavemeter Channels', []) or []
+            vals = raw_metadata.get('Wavemeter Values', []) or []
+            # ZIP safely
+            pairs = [(str(n or ""), float(v)) for n, v in zip(chs, vals)]
+            filtered = [
+                (n, v) for (n, v) in pairs
+                if ('laser' in n.lower()) and np.isfinite(v) and (v != 0.0)
+            ]
+            if filtered:
+                lines.append("Wavemeter (nm):")
+                # Convert to nm if values look like wavelength in meters; otherwise print raw
+                for name, val in filtered:
+                    lines.append(f"  {name}: {val * 1e9:.8g}")
+
+        # B-field spherical (consistent with VectorMagnetLogic)
+        b_sph = raw_metadata.get('Magnetic Field (spherical)') or {}
+        try:
+            bmag_T = float(b_sph.get('Bmag_T', float('nan')))
+            th = float(b_sph.get('theta_user_deg', float('nan')))
+            ph = float(b_sph.get('phi_deg', float('nan')))
+            if math.isfinite(bmag_T):
+                lines.append(f'B: {bmag_T * 1e3:.3f} mT')
+            # angles may still be useful even if Bmag is NaN
+            ang_parts = []
+            if math.isfinite(th): ang_parts.append(f'θ={th:.2f}°')
+            if math.isfinite(ph): ang_parts.append(f'φ={ph:.2f}°')
+            if ang_parts:
+                lines.append(', '.join(ang_parts))
+        except Exception:
+            pass
+
+        # Generation method parameters (truncate to keep compact)
+        try:
+            gen = signal_metadata.get('generation method parameters', {}) or {}
+            if gen:
+                lines.append('Gen. Params:')
+                for k, v in list(gen.items())[:8]:
+                    try:
+                        fv = float(v)
+                        lines.append(f'  {k}: {fv:.6g}')
+                    except Exception:
+                        sv = str(v)
+                        if len(sv) > 32:
+                            sv = sv[:29] + '...'
+                        lines.append(f'  {k}: {sv}')
+        except Exception:
+            pass
+
+        return lines

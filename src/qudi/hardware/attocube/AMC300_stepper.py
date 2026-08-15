@@ -26,7 +26,7 @@ from __future__ import annotations
 import time
 from typing import Dict, List, Optional
 
-from PySide2 import QtCore
+from PySide6 import QtCore
 
 from qudi.core.configoption import ConfigOption
 from qudi.util.mutex import Mutex
@@ -111,6 +111,10 @@ class AMC300_stepper(ScanningProbeInterface):
     _drive_enable_on_activate: bool = ConfigOption('drive_enable_on_activate', default=True, missing='warn')
     _settle_time_s: float = ConfigOption('settle_time_s', default=0.001, missing='warn')
     _max_move_timeout_s: float = ConfigOption('max_move_timeout_s', default=5.0, missing='warn')
+    _force_single_steps: bool = ConfigOption('force_single_steps', default=False, missing='nothing')
+    _reset_frontpanel_nsteps_after_move: bool = ConfigOption(
+        'reset_frontpanel_nsteps_after_move', default=False, missing='nothing'
+    )
 
     sigPositionChanged = QtCore.Signal(dict)
 
@@ -290,12 +294,24 @@ class AMC300_stepper(ScanningProbeInterface):
                 backward = True if n_steps < 0 else False
                 steps = abs(n_steps)
                 # Try bulk step; fallback to single-step loop
-                try:
-                    dev.move.setNSteps(ch, backward, steps)
-                except Exception:
+                if self._force_single_steps:
+                    # Execute exactly 'steps' single steps
                     for _ in range(steps):
-                        dev.move.setSingleStep(ch, backward)
+                        dev.move.setSingleStep(ch, bool(backward))
+                else:
+                    # Existing behavior: try bulk N-steps, fall back to single steps if unavailable
+                    try:
+                        dev.move.setNSteps(ch, bool(backward), int(steps))
+                    except Exception:
+                        for _ in range(steps):
+                            dev.move.setSingleStep(ch, bool(backward))
+
                 self._target_m[ax] = pos_m + n_steps * step_m
+                if self._reset_frontpanel_nsteps_after_move:
+                    try:
+                        dev.move.writeNSteps(ch, 1)
+                    except Exception:
+                        pass
 
         if blocking:
             for ax in position.keys():
@@ -419,6 +435,16 @@ class AMC300_stepper(ScanningProbeInterface):
                     ch = self._axis_to_channel(ax)
                     try:
                         self._dev.control.setControlMove(ch, False)  # type: ignore
+                    except Exception:
+                        pass
+
+        if self._reset_frontpanel_nsteps_after_move:
+            with self._thread_lock:
+                dev = self._require_dev()
+                for ax in axes:
+                    ch = self._axis_to_channel(ax)
+                    try:
+                        dev.move.writeNSteps(ch, 1)
                     except Exception:
                         pass
 
@@ -578,3 +604,208 @@ class AMC300_stepper(ScanningProbeInterface):
                 measured_step = delta / float(step_count)
 
         return {axis: float(measured_step)}
+
+    def set_force_single_steps(self, enabled: bool) -> None:
+        """
+        Enable/disable forcing moves to use only single-step commands (never setNSteps).
+        This helps keep the controller's 'Single step' UI at 1 and can improve reliability.
+        Runtime setting (not persisted to config).
+        """
+        with self._thread_lock:
+            self._force_single_steps = bool(enabled)
+        try:
+            self.log.info(f'force_single_steps set to {self._force_single_steps}')
+        except Exception:
+            pass
+
+    def get_force_single_steps(self) -> bool:
+        """
+        Return whether single-step-only motion is currently forced.
+        """
+        # Read without lock is fine; if you prefer, wrap with self._thread_lock
+        return bool(getattr(self, '_force_single_steps', False))
+
+    def set_reset_frontpanel_nsteps_after_move(self, enabled: bool) -> None:
+        """
+        Enable/disable automatically resetting AMC front-panel 'Single step' count to 1
+        after every move (open-loop and closed-loop).
+        """
+        with self._thread_lock:
+            self._reset_frontpanel_nsteps_after_move = bool(enabled)
+        try:
+            self.log.info(f'reset_frontpanel_nsteps_after_move set to {self._reset_frontpanel_nsteps_after_move}')
+        except Exception:
+            pass
+
+    def get_reset_frontpanel_nsteps_after_move(self) -> bool:
+        """Return whether automatic reset of front-panel 'Single step' count is enabled."""
+        return bool(getattr(self, '_reset_frontpanel_nsteps_after_move', False))
+
+    def set_frontpanel_step_count(self, axis: str, steps: int) -> None:
+        """
+        Set the controller front-panel 'Single step' count for a given axis.
+        Uses AMC.move.writeNSteps; affects manual stepping/UI only (PRO feature).
+        """
+        steps = int(steps)
+        if steps <= 0:
+            raise ValueError('steps must be a positive integer')
+        with self._thread_lock:
+            dev = self._require_dev()
+            ch = self._axis_to_channel(axis)
+            try:
+                dev.move.writeNSteps(ch, steps)
+            except Exception:
+                self.log.warning('AMC: writeNSteps not available or failed.')
+
+    def get_frontpanel_step_count(self, axis: str) -> int:
+        """
+        Read the controller front-panel 'Single step' count for a given axis via AMC.move.getNSteps.
+        """
+        with self._thread_lock:
+            dev = self._require_dev()
+            ch = self._axis_to_channel(axis)
+            try:
+                val = int(dev.move.getNSteps(ch))
+            except Exception:
+                self.log.warning('AMC: getNSteps not available or failed.')
+                val = 1
+        return val
+
+    def reset_frontpanel_step_count(self, axis: Optional[str] = None) -> None:
+        """
+        Reset 'Single step' count to 1 on one axis or all axes (UI convenience).
+        """
+        with self._thread_lock:
+            dev = self._require_dev()
+            axes = [axis] if axis is not None else list(self._axis_map.keys())
+            for ax in axes:
+                ch = self._axis_to_channel(ax)
+                try:
+                    dev.move.writeNSteps(ch, 1)
+                except Exception:
+                    # Non‑PRO or older firmware may not support this; ignore
+                    pass
+
+    def calibrate_axis_step_size(
+            self,
+            *,
+            axis: str,
+            distance_m: float = 10e-6,
+            window_nm: int = 600,
+            timeout_s: float = 30.0,
+            max_steps: Optional[int] = None,
+            poll_interval_s: float = 0.002,
+    ) -> float:
+        """
+        Perform a calibration movement on a single axis over 'distance_m' (default 10 µm),
+        measure the effective step size, update self._step_size_m[axis], and return the new step size (m/step).
+
+        Procedure:
+          1) Read current device position on the axis.
+          2) Choose a valid [start, end] segment within configured position range with length ~distance_m.
+          3) Use calibration_movement(...) to step and measure.
+          4) Update internal step size for the axis via set_step_size_m(axis, measured).
+
+        Notes:
+          - Uses controller closed-loop to approach the start, then steps open-loop as in scanning calibration.
+          - Does not change scanning settings; this only updates the step size used by normal open-loop moves.
+        """
+        axis = str(axis)
+        # Validate axis and read ranges
+        if axis not in self._axis_map:
+            raise KeyError(f'Unknown axis "{axis}"')
+        if distance_m <= 0:
+            raise ValueError('distance_m must be > 0')
+
+        with self._thread_lock:
+            dev = self._require_dev()
+            ch = self._axis_to_channel(axis)
+            rng = self._position_ranges.get(axis, None)
+            if not rng or len(rng) < 2:
+                raise RuntimeError(f'No valid position range for axis "{axis}"')
+            lo, hi = float(rng[0]), float(rng[1])
+
+            # Current measured position (fallback to target)
+            try:
+                pos_nm = float(dev.move.getPosition(ch))
+                curr_m = pos_nm * 1e-9
+            except Exception:
+                curr_m = self._target_m.get(axis, (lo + hi) * 0.5)
+
+        # Choose a calibration segment near current position; clamp to range
+        seg = float(distance_m)
+        total_span = hi - lo
+        if seg > total_span:
+            # If requested distance exceeds range, reduce to full span
+            seg = total_span
+        # Try to center around current position
+        start_m = max(lo, min(curr_m - 0.5 * seg, hi - seg))
+        end_m = start_m + seg
+
+        # Run the step-counting calibration over the chosen segment
+        measured = self.calibration_movement(
+            axis=axis,
+            start_m=float(start_m),
+            end_m=float(end_m),
+            window_nm=int(window_nm),
+            max_steps=max_steps,
+            timeout_s=float(timeout_s),
+            poll_interval_s=float(poll_interval_s),
+        )
+        step_m = float(measured[axis])
+
+        # Update configured step size for this axis
+        self.set_step_size_m(axis, step_m)
+
+        # Optionally, keep the panel 'Single step' at 1 if that feature is enabled
+        try:
+            if getattr(self, '_reset_frontpanel_nsteps_after_move', False):
+                with self._thread_lock:
+                    dev = self._require_dev()
+                    ch = self._axis_to_channel(axis)
+                    try:
+                        dev.move.writeNSteps(ch, 1)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            self.log.info(f'Calibration axis {axis}: step size set to {step_m:.3e} m/step '
+                          f'(segment {seg:.3e} m, window {int(window_nm)} nm)')
+        except Exception:
+            pass
+        return step_m
+
+    def calibrate_all_axes_step_size(
+            self,
+            *,
+            distance_m: float = 10e-6,
+            window_nm: int = 600,
+            timeout_s: float = 30.0,
+            max_steps: Optional[int] = None,
+            poll_interval_s: float = 0.002,
+    ) -> Dict[str, float]:
+        """
+        Calibrate and update step sizes for all configured axes.
+        Returns a dict {axis: step_size_m}.
+        """
+        results: Dict[str, float] = {}
+        for axis in list(self._axis_map.keys()):
+            try:
+                step_m = self.calibrate_axis_step_size(
+                    axis=axis,
+                    distance_m=distance_m,
+                    window_nm=window_nm,
+                    timeout_s=timeout_s,
+                    max_steps=max_steps,
+                    poll_interval_s=poll_interval_s,
+                )
+                results[axis] = step_m
+            except Exception:
+                # Log and continue with other axes
+                try:
+                    self.log.exception(f'Calibration failed on axis {axis}')
+                except Exception:
+                    pass
+        return results

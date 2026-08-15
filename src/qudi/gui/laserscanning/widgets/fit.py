@@ -21,7 +21,7 @@ If not, see <https://www.gnu.org/licenses/>.
 
 __all__ = ['FitControl', 'FitControlDockWidget']
 
-from PySide2 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from qudi.util.datafitting import FitContainer
 from qudi.util.widgets.fitting import FitWidget as _FitWidget
