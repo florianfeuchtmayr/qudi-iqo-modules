@@ -20,7 +20,7 @@ top-level directory of this distribution and at <https://github.com/Ulm-IQO/qudi
 import time
 
 from qudi.interface.pid_controller_interface import PIDControllerInterface
-import visa
+import pyvisa as visa
 
 from qudi.core.module import Base
 from qudi.core.configoption import ConfigOption
