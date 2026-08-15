@@ -26,7 +26,7 @@ from __future__ import annotations
 import time
 from typing import Dict, List, Optional
 
-from PySide2 import QtCore
+from PySide6 import QtCore
 
 from qudi.core.configoption import ConfigOption
 from qudi.util.mutex import Mutex

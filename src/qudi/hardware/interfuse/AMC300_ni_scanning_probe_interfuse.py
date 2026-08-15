@@ -28,7 +28,7 @@ import time
 import numpy as np
 from typing import Dict, List, Optional
 
-from PySide2 import QtCore
+from PySide6 import QtCore
 
 from qudi.core.configoption import ConfigOption
 from qudi.core.connector import Connector
