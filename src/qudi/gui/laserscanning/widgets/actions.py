@@ -41,11 +41,13 @@ class LaserScanningActions:
     action_show_histogram_region: QtGui.QAction
     action_restore_view: QtGui.QAction
     action_laser_only: QtGui.QAction
+    action_show_all_data: QtGui.QAction
+    action_show_stabilization_configuration: QtGui.QAction
 
     def __init__(self):
         super().__init__()
 
-        # Create QActions (QAction is in QtGui in PySide6, not QtWidgets)
+        # Create QActions
         self.action_close = QtGui.QAction('Close')
         self.action_save = QtGui.QAction('Save')
         self.action_show_fit_configuration = QtGui.QAction('Fit Configuration')
@@ -57,7 +59,8 @@ class LaserScanningActions:
         self.action_show_histogram_region = QtGui.QAction('Show histogram region')
         self.action_restore_view = QtGui.QAction('Restore default')
         self.action_laser_only = QtGui.QAction('Laser-Only Mode')
-
+        self.action_show_all_data = QtGui.QAction('Show all data')
+        self.action_show_stabilization_configuration = QtGui.QAction('Stabilization Configuration')
         # Create and set icons
         icon_path = os.path.join(get_artwork_dir(), 'icons')
         exit_icon = QtGui.QIcon(os.path.join(icon_path, 'application-exit'))
@@ -69,7 +72,7 @@ class LaserScanningActions:
         record_icon.addFile(os.path.join(icon_path, 'stop-counter'), state=QtGui.QIcon.State.On)
         play_icon = QtGui.QIcon(os.path.join(icon_path, 'start-counter'))
         play_icon.addFile(os.path.join(icon_path, 'stop-counter'), state=QtGui.QIcon.State.On)
-
+        alldata_icon = QtGui.QIcon(os.path.join(icon_path, 'all-data'))
         self.action_close.setIcon(exit_icon)
         self.action_save.setIcon(save_icon)
         self.action_show_fit_configuration.setIcon(configure_icon)
@@ -77,7 +80,7 @@ class LaserScanningActions:
         self.action_start_stop_scan.setIcon(play_icon)
         self.action_clear_data.setIcon(clear_icon)
         self.action_autoscale_histogram.setIcon(scale_icon)
-
+        self.action_show_stabilization_configuration.setIcon(configure_icon)
         # Set tooltips
         self.action_close.setToolTip('Close window. Does NOT deactivate module.')
         self.action_save.setToolTip('Save all data')
@@ -96,7 +99,8 @@ class LaserScanningActions:
         self.action_show_histogram_region.setToolTip('Show visual overlay of the histogram span.')
         self.action_restore_view.setToolTip('Restores default view of the window')
         self.action_laser_only.setToolTip('If checked, the measurement will record laser data only')
-
+        self.action_show_all_data.setToolTip('Show all recorded data in the plot')
+        self.action_show_stabilization_configuration.setToolTip('Open a dialog to edit stabilization parameters.')
         # Configure checkable flags
         self.action_close.setCheckable(False)
         self.action_save.setCheckable(False)
@@ -109,3 +113,5 @@ class LaserScanningActions:
         self.action_show_histogram_region.setCheckable(True)
         self.action_restore_view.setCheckable(False)
         self.action_laser_only.setCheckable(True)
+        self.action_show_all_data.setCheckable(False)
+        self.action_show_stabilization_configuration.setCheckable(False)
