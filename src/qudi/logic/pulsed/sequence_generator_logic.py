@@ -99,24 +99,32 @@ class SequenceGeneratorLogic(LogicBase):
     # status vars
     # Global parameters describing the channel usage and common parameters used during pulsed object
     # generation for predefined methods.
-    _generation_parameters = StatusVar(
-        default={
-            'laser_channel': 'd_ch1',
-            'sync_channel': '',
-            'gate_channel': '',
-            'microwave_channel': 'a_ch1',
-            'microwave_frequency': 2.87e9,
-            'microwave_amplitude': 0.0,
-            'rabi_period': 100e-9,
-            'laser_length': 3e-6,
-            'laser_delay': 500e-9,
-            'wait_time': 1e-6,
-            'analog_trigger_voltage': 0.0,
-            'optimal_control_assets_path': 'C:\\Software\\qudi_data\\optimal_control_assets',
-            'pulse_envelope': PulseEnvelope(PulseEnvelopeType.rectangle),
-            'pulse_envelope_order': 1,
-        }
-    )
+    _default_generation_parameters = {
+        'laser_channel': 'd_ch1',
+        'sync_channel': '',
+        'gate_channel': '',
+        'microwave_channel': 'a_ch1',
+        'microwave_frequency': 2.87e9,
+        'microwave_amplitude': 0.0,
+        'rabi_period': 100e-9,
+        'laser_length': 3e-6,
+        'laser_delay': 500e-9,
+        'wait_time': 1e-6,
+        'analog_trigger_voltage': 0.0,
+        'optimal_control_assets_path': 'C:\\Software\\qudi_data\\optimal_control_assets',
+        'pulse_envelope': PulseEnvelope(PulseEnvelopeType.rectangle),
+        'pulse_envelope_order': 1,
+    }
+    _generation_parameters = StatusVar(default=_default_generation_parameters)
+
+    @_generation_parameters.constructor
+    def _generation_parameters_constructor(self, params):
+        # Saved parameters from older versions may lack newly added keys (e.g. pulse_envelope).
+        # Fill them in from the defaults.
+        merged = copy.deepcopy(self._default_generation_parameters)
+        if isinstance(params, dict):
+            merged.update(params)
+        return merged
 
     # The created pulse objects (PulseBlock, PulseBlockEnsemble, PulseSequence) are saved in
     # these dictionaries. The keys are the names.

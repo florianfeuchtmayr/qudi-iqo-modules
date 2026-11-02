@@ -1689,3 +1689,192 @@ class BasicPredefinedGenerator(PredefinedGeneratorBase):
         # Append PulseSequence to created_sequences list
         created_sequences.append(t1_sequence)
         return created_blocks, created_ensembles, created_sequences
+
+    def generate_ssr_one_transition(self, name='ssr_one_trans', tau_start=5.0e-6, tau_step=1.0e-6,
+                                    num_of_points=1, short_gap=100.0e-9):
+        """Single-shot readout reference sequence for a single addressable transition.
+
+        Per tau point two laser pulses (readout = pump on the same transition):
+            idle(tau) -> laser (mixture: spin partly recovered via T1)
+            idle(short_gap) -> laser (dark reference: spin just pumped away)
+        The laser length (laser_length generation parameter) must be several pumping times so that
+        each pulse leaves the spin fully pumped. With alternating=True semantics the first laser of a
+        pair is the signal (mixture) and the second the reference (dark).
+
+        Parameters
+        ----------
+        name : str
+            Name of the PulseBlockEnsemble to be generated.
+        tau_start: float
+            Start of the recovery wait before the mixture readout in seconds (choose >~ T1).
+        tau_step: float
+            Tau step in seconds.
+        num_of_points: int
+            Number of tau points. Use 1 for SSR statistics at fixed tau, >1 for a T1 recovery curve.
+        short_gap: float
+            Wait between the end of the mixture readout (incl. laser delay) and the dark readout in
+            seconds (choose << T1).
+
+        Returns
+        -------
+        created_blocks : list
+            List of PulseBlock objects created.
+        created_ensembles : list
+            List of PulseBlockEnsemble objects created.
+        created_sequences : list
+            List of PulseSequence objects created.
+        """
+        created_blocks = list()
+        created_ensembles = list()
+        created_sequences = list()
+
+        # get tau array for measurement ticks
+        tau_array = tau_start + np.arange(num_of_points) * tau_step
+
+        # create the elements
+        tau_element = self._get_idle_element(length=tau_start, increment=tau_step)
+        short_gap_element = self._get_idle_element(length=short_gap, increment=0)
+        laser_element = self._get_laser_gate_element(length=self.laser_length, increment=0)
+        delay_element = self._get_delay_gate_element()
+
+        ssr_block = PulseBlock(name=name)
+        # mixture readout after recovery time tau
+        ssr_block.append(tau_element)
+        ssr_block.append(laser_element)
+        ssr_block.append(delay_element)
+        # dark reference readout right after pumping
+        ssr_block.append(short_gap_element)
+        ssr_block.append(laser_element)
+        ssr_block.append(delay_element)
+        created_blocks.append(ssr_block)
+
+        # Create block ensemble
+        block_ensemble = PulseBlockEnsemble(name=name, rotating_frame=False)
+        block_ensemble.append((ssr_block.name, num_of_points - 1))
+
+        # Create and append sync trigger block if needed
+        self._add_trigger(created_blocks=created_blocks, block_ensemble=block_ensemble)
+
+        # add metadata to invoke settings later on
+        block_ensemble.measurement_information['alternating'] = True
+        block_ensemble.measurement_information['laser_ignore_list'] = list()
+        block_ensemble.measurement_information['controlled_variable'] = tau_array
+        block_ensemble.measurement_information['units'] = ('s', '')
+        block_ensemble.measurement_information['labels'] = ('Tau<sub>recovery</sub>', 'Signal')
+        block_ensemble.measurement_information['number_of_lasers'] = 2 * num_of_points
+        block_ensemble.measurement_information['counting_length'] = self._get_ensemble_count_length(
+            ensemble=block_ensemble, created_blocks=created_blocks)
+        # append ensemble to created ensembles
+        created_ensembles.append(block_ensemble)
+        return created_blocks, created_ensembles, created_sequences
+
+    def generate_single_mw_pulse(self, name='single_mw', pulse_length=0.3e-9, wait_length=100e-9):
+        created_blocks, created_ensembles, created_sequences = list(), list(), list()
+        mw_element = self._get_mw_element(length=pulse_length, increment=0,
+                                          amp=self.microwave_amplitude,
+                                          freq=self.microwave_frequency, phase=0)
+        waiting_element = self._get_idle_element(length=wait_length, increment=0)
+        block = PulseBlock(name=name)
+        block.append(mw_element)
+        block.append(waiting_element)
+        created_blocks.append(block)
+        block_ensemble = PulseBlockEnsemble(name=name, rotating_frame=False)
+        block_ensemble.append((block.name, 0))
+        self._add_trigger(created_blocks=created_blocks, block_ensemble=block_ensemble)
+        block_ensemble.measurement_information['alternating'] = False
+        block_ensemble.measurement_information['laser_ignore_list'] = list()
+        block_ensemble.measurement_information['controlled_variable'] = [pulse_length]
+        block_ensemble.measurement_information['units'] = ('s', '')
+        block_ensemble.measurement_information['labels'] = ('Pulse length', 'Signal')
+        block_ensemble.measurement_information['number_of_lasers'] = 1
+        block_ensemble.measurement_information['counting_length'] = self._get_ensemble_count_length(
+            ensemble=block_ensemble, created_blocks=created_blocks)
+        created_ensembles.append(block_ensemble)
+        return created_blocks, created_ensembles, created_sequences
+
+    def generate_cpmg_tau(self, name='cpmg_tau', tau_start=0.2e-6, tau_step=0.1e-6, num_of_points=40,
+                          cpmg_order=8, alternating=True):
+        """CPMG-N with tau = centre-to-centre spacing of the pi pulses.
+
+        Paste into a PredefinedGeneratorBase subclass (e.g. next to generate_ssr_one_transition in your
+        own predefined-methods file); uses the same helpers as the qudi basic predefined methods.
+
+            pi/2_x - tau/2 - [pi_y - tau]x(N-1) - pi_y - tau/2 - pi/2_(x | -x) - laser - delay
+
+        Total free evolution = cpmg_order * tau. The pi pulses are along y, so the state prepared by
+        pi/2_x stays along the pi axis (pulse errors do not accumulate to first order for this state).
+        alternating: second readout with the final pi/2 at phase 180 (-x) as reference.
+
+        Parameters
+        ----------
+        tau_start : float
+            First pi-pulse spacing in s. Must be > pi length (+ pi/2 length), otherwise idles go negative.
+        tau_step : float
+            Spacing step in s.
+        num_of_points : int
+            Number of tau points.
+        cpmg_order : int
+            Number of pi pulses N.
+        alternating : bool
+            Add the -x reference readout.
+        """
+        created_blocks = list()
+        created_ensembles = list()
+        created_sequences = list()
+
+        pi_len = self.rabi_period / 2
+        pihalf_len = self.rabi_period / 4
+        if tau_start - pi_len - pihalf_len < 0:
+            self.log.error('CPMG: tau_start {0:.3g} s is shorter than pi + pi/2 pulse lengths.'.format(tau_start))
+            return created_blocks, created_ensembles, created_sequences
+
+        tau_array = tau_start + np.arange(num_of_points) * tau_step
+
+        # idles: half spacing at both ends (from pi/2 edge to pi edge), full spacing between pi pulses
+        half_idle = self._get_idle_element(length=tau_start / 2 - pi_len / 2 - pihalf_len / 2,
+                                           increment=tau_step / 2)
+        full_idle = self._get_idle_element(length=tau_start - pi_len, increment=tau_step)
+        pihalf_x = self._get_mw_element(length=pihalf_len, increment=0, amp=self.microwave_amplitude,
+                                        freq=self.microwave_frequency, phase=0)
+        pihalf_mx = self._get_mw_element(length=pihalf_len, increment=0, amp=self.microwave_amplitude,
+                                         freq=self.microwave_frequency, phase=180)
+        pi_y = self._get_mw_element(length=pi_len, increment=0, amp=self.microwave_amplitude,
+                                    freq=self.microwave_frequency, phase=90)
+        laser_element = self._get_laser_gate_element(length=self.laser_length, increment=0)
+        delay_element = self._get_delay_gate_element()
+        waiting_element = self._get_idle_element(length=self.wait_time, increment=0)
+
+        def cpmg_part(block, final_pihalf):
+            block.append(pihalf_x)
+            block.append(half_idle)
+            for i in range(cpmg_order):
+                block.append(pi_y)
+                block.append(full_idle if i < cpmg_order - 1 else half_idle)
+            block.append(final_pihalf)
+            block.append(laser_element)
+            block.append(delay_element)
+            block.append(waiting_element)
+
+        cpmg_block = PulseBlock(name=name)
+        cpmg_part(cpmg_block, pihalf_x)
+        if alternating:
+            cpmg_part(cpmg_block, pihalf_mx)
+        created_blocks.append(cpmg_block)
+
+        block_ensemble = PulseBlockEnsemble(name=name, rotating_frame=True)
+        block_ensemble.append((cpmg_block.name, num_of_points - 1))
+
+        # Create and append sync trigger block if needed
+        self._add_trigger(created_blocks=created_blocks, block_ensemble=block_ensemble)
+
+        number_of_lasers = 2 * num_of_points if alternating else num_of_points
+        block_ensemble.measurement_information['alternating'] = alternating
+        block_ensemble.measurement_information['laser_ignore_list'] = list()
+        block_ensemble.measurement_information['controlled_variable'] = tau_array * cpmg_order
+        block_ensemble.measurement_information['units'] = ('s', '')
+        block_ensemble.measurement_information['labels'] = ('Total evolution N&#183;tau', 'Signal')
+        block_ensemble.measurement_information['number_of_lasers'] = number_of_lasers
+        block_ensemble.measurement_information['counting_length'] = self._get_ensemble_count_length(
+            ensemble=block_ensemble, created_blocks=created_blocks)
+        created_ensembles.append(block_ensemble)
+        return created_blocks, created_ensembles, created_sequences
